@@ -1,8 +1,19 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_left
+from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 from statistics import mean
+
+from baystfirm.models import Classification
+
+NORMAL_LABELS = {
+    "stablecoin_peg": "pegged",
+    "short_horizon_momentum": "range_bound",
+}
 
 
 @dataclass(frozen=True)
@@ -13,6 +24,7 @@ class EvaluationRecord:
     abstained: bool
     latency_ms: float
     normal_label: str
+    classifier: str = ""
 
     @property
     def correct(self) -> bool:
@@ -109,3 +121,46 @@ def _expected_calibration_error(records: list[EvaluationRecord], bins: int) -> f
         accuracy = mean(record.correct for record in bucket)
         error += len(bucket) / len(records) * abs(confidence - accuracy)
     return error
+
+
+def evaluate_by_classifier(records: Sequence[EvaluationRecord]) -> dict[str, EvaluationMetrics]:
+    grouped: dict[str, list[EvaluationRecord]] = defaultdict(list)
+    for record in records:
+        grouped[record.classifier].append(record)
+    return {name: evaluate(items) for name, items in sorted(grouped.items())}
+
+
+def label_classifications(
+    classifications: Sequence[Classification],
+    *,
+    tolerance_seconds: float = 5.0,
+) -> list[EvaluationRecord]:
+    """Label each prediction with the state the same classifier observed one horizon later."""
+    outcomes: dict[tuple[str, str], list[Classification]] = defaultdict(list)
+    for item in classifications:
+        if not item.abstained:
+            outcomes[(item.classifier, item.symbol)].append(item)
+    for items in outcomes.values():
+        items.sort(key=lambda item: item.observed_at)
+    times = {key: [item.observed_at for item in items] for key, items in outcomes.items()}
+    tolerance = timedelta(seconds=tolerance_seconds)
+    records: list[EvaluationRecord] = []
+    for prediction in classifications:
+        key = (prediction.classifier, prediction.symbol)
+        target = prediction.observed_at + timedelta(seconds=prediction.horizon_seconds)
+        candidates = times.get(key, [])
+        index = bisect_left(candidates, target)
+        if index == len(candidates) or candidates[index] > target + tolerance:
+            continue
+        records.append(
+            EvaluationRecord(
+                predicted_label=prediction.label,
+                expected_label=outcomes[key][index].label,
+                probability=prediction.probability,
+                abstained=prediction.abstained,
+                latency_ms=prediction.freshness_ms,
+                normal_label=NORMAL_LABELS.get(prediction.classifier, ""),
+                classifier=prediction.classifier,
+            )
+        )
+    return records

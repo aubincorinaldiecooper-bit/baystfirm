@@ -4,6 +4,30 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+DEFAULT_VENUES = "coinbase,kraken,bybit,okx"
+DEFAULT_SYMBOLS = ",".join(
+    (
+        "BTC-USD",
+        "ETH-USD",
+        "SOL-USD",
+        "BTC-USDT",
+        "ETH-USDT",
+        "SOL-USDT",
+        "USDT-USD",
+        "USDC-USD",
+        "PYUSD-USD",
+        "DAI-USD",
+        "USDC-USDT",
+        "DAI-USDT",
+        "USDE-USDT",
+        "FDUSD-USDT",
+        "PYUSD-USDT",
+        "BTC-USDT-PERP",
+        "ETH-USDT-PERP",
+        "SOL-USDT-PERP",
+    )
+)
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -16,15 +40,12 @@ class Settings:
     def from_env(cls) -> Settings:
         venues = tuple(
             value.strip().lower()
-            for value in os.getenv("BAYST_VENUES", "coinbase,kraken,bybit").split(",")
+            for value in os.getenv("BAYST_VENUES", DEFAULT_VENUES).split(",")
             if value.strip()
         )
         symbols = tuple(
             value.strip().upper()
-            for value in os.getenv(
-                "BAYST_SYMBOLS",
-                "BTC-USD,ETH-USD,USDC-USD,USDT-USD,BTC-USDT-PERP,ETH-USDT-PERP",
-            ).split(",")
+            for value in os.getenv("BAYST_SYMBOLS", DEFAULT_SYMBOLS).split(",")
             if value.strip()
         )
         return cls(

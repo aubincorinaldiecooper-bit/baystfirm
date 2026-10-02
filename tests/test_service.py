@@ -22,4 +22,5 @@ def test_health_and_evaluation_gate(tmp_path: Path) -> None:
 
         gate = client.get("/v1/evaluation/gate")
         assert gate.status_code == 200
-        assert gate.json()["promotion_eligible"] is False
+        assert gate.json()["status"] == "shadow"
+        assert gate.json()["runs"] == []

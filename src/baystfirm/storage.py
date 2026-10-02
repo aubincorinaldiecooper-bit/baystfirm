@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+from uuid import uuid4
 
 import aiosqlite
 
@@ -48,6 +51,16 @@ class EventStore:
                 probability REAL NOT NULL,
                 abstained INTEGER NOT NULL,
                 shadow INTEGER NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS evaluation_runs (
+                run_id TEXT PRIMARY KEY,
+                classifier TEXT NOT NULL,
+                created_at TEXT NOT NULL,
                 payload TEXT NOT NULL
             )
             """
@@ -174,3 +187,29 @@ class EventStore:
         row = await cursor.fetchone()
         await cursor.close()
         return int(row[0]) if row else 0
+
+    async def append_evaluation_run(self, classifier: str, payload: dict[str, Any]) -> str:
+        run_id = str(uuid4())
+        created_at = datetime.now(UTC).isoformat()
+        record = {"run_id": run_id, "classifier": classifier, "created_at": created_at, **payload}
+        await self.connection.execute(
+            "INSERT INTO evaluation_runs (run_id, classifier, created_at, payload) "
+            "VALUES (?, ?, ?, ?)",
+            (run_id, classifier, created_at, json.dumps(record)),
+        )
+        await self.connection.commit()
+        return run_id
+
+    async def latest_evaluation_runs(self) -> list[dict[str, Any]]:
+        cursor = await self.connection.execute(
+            """
+            SELECT payload FROM evaluation_runs AS run
+            WHERE created_at = (
+                SELECT MAX(created_at) FROM evaluation_runs WHERE classifier = run.classifier
+            )
+            ORDER BY classifier
+            """
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [json.loads(row[0]) for row in rows]

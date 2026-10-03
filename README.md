@@ -30,7 +30,10 @@ python3 -m venv .venv
 ```
 
 The API is served at `http://127.0.0.1:8000`. The realtime normalized stream is available over
-WebSocket at `/v1/stream`.
+WebSocket at `/v1/stream` and as server-sent events at `/v1/stream/sse` (optional
+`?symbols=USDC-USD,BTC-USD`; `market_event` and `classification` events, a keepalive comment every
+15 seconds). `/v1/snapshot` returns the latest event per venue and instrument and the latest
+classification per classifier and instrument, so a client can render before the stream delivers.
 
 Replay captured events through the shadow classifiers without sleeping:
 
@@ -59,6 +62,7 @@ Evaluate externally labeled newline-delimited prediction records:
 | `BAYST_VENUES` | `coinbase,kraken,bybit,okx` | Public stream adapters to run |
 | `BAYST_SYMBOLS` | Majors, stablecoins, and perpetuals | Canonical instruments; each venue subscribes to the ones it lists |
 | `BAYST_SHADOW_MODE` | `true` | Prevent unvalidated classifications from becoming trusted |
+| `BAYST_API_KEY` | _(empty)_ | When set, every `/v1` route requires `Authorization: Bearer <key>` (`/health` stays open) |
 
 ## Implemented foundation
 

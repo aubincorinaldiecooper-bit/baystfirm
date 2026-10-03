@@ -35,6 +35,7 @@ class Settings:
     enabled_venues: tuple[str, ...]
     shadow_mode: bool
     symbols: tuple[str, ...]
+    api_key: str | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -53,4 +54,5 @@ class Settings:
             enabled_venues=venues,
             shadow_mode=os.getenv("BAYST_SHADOW_MODE", "true").lower() not in {"0", "false", "no"},
             symbols=symbols,
+            api_key=os.getenv("BAYST_API_KEY", "").strip() or None,
         )

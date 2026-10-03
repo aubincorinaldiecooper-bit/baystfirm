@@ -15,6 +15,14 @@ logger = logging.getLogger(__name__)
 EmitEvent = Callable[[MarketEvent], Awaitable[None]]
 
 
+STABLE_QUOTES = frozenset({"USDT", "USDC"})
+
+
+def split_symbol(symbol: str) -> tuple[str, str]:
+    base, quote = symbol.split("-", maxsplit=1)
+    return base, quote
+
+
 class MarketAdapter(ABC):
     name: str
     websocket_url: str
@@ -47,7 +55,12 @@ class MarketAdapter(ABC):
                         raw = await asyncio.wait_for(websocket.recv(), timeout=30)
                         if isinstance(raw, bytes):
                             raw = raw.decode()
-                        for event in self.parse_message(raw):
+                        try:
+                            events = self.parse_message(raw)
+                        except (KeyError, TypeError, ValueError):
+                            logger.warning("%s sent an unparseable message", self.name)
+                            continue
+                        for event in events:
                             await emit(event)
             except TimeoutError:
                 logger.warning("%s market stream timed out", self.name)

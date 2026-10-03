@@ -22,14 +22,9 @@ class CoinbaseAdapter(MarketAdapter):
         super().__init__(tuple(symbol for symbol in symbols if not symbol.endswith("-PERP")))
 
     def subscription_messages(self) -> list[dict[str, Any]]:
-        if not self.symbols:
-            return []
         return [
-            {
-                "type": "subscribe",
-                "product_ids": list(self.symbols),
-                "channels": ["matches"],
-            }
+            {"type": "subscribe", "product_ids": [symbol], "channels": ["matches"]}
+            for symbol in self.symbols
         ]
 
     def parse_message(self, raw: str) -> list[MarketEvent]:

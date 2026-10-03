@@ -38,7 +38,14 @@ Replay captured events through the shadow classifiers without sleeping:
 .venv/bin/baystfirm replay --database var/baystfirm.db --speed 0
 ```
 
-Evaluate newline-delimited prediction records:
+Replay stored events, label every prediction with the state observed one horizon later, score
+each classifier against the promotion gate, and record the run (served at `/v1/evaluation/gate`):
+
+```bash
+.venv/bin/baystfirm evaluate-replay --database var/baystfirm.db
+```
+
+Evaluate externally labeled newline-delimited prediction records:
 
 ```bash
 .venv/bin/baystfirm evaluate evaluation-records.jsonl
@@ -49,17 +56,21 @@ Evaluate newline-delimited prediction records:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `BAYST_DATABASE_PATH` | `var/baystfirm.db` | SQLite event and classification store |
-| `BAYST_VENUES` | `coinbase,kraken,bybit` | Public stream adapters to run |
-| `BAYST_SYMBOLS` | Core spot and perpetual pairs | Canonical instruments to subscribe to |
+| `BAYST_VENUES` | `coinbase,kraken,bybit,okx` | Public stream adapters to run |
+| `BAYST_SYMBOLS` | Majors, stablecoins, and perpetuals | Canonical instruments; each venue subscribes to the ones it lists |
 | `BAYST_SHADOW_MODE` | `true` | Prevent unvalidated classifications from becoming trusted |
 
 ## Implemented foundation
 
-- normalized public trade adapters for Coinbase spot, Kraken spot, and Bybit linear perpetuals;
+- normalized public trade adapters for Coinbase spot, Kraken spot, OKX spot, Bybit spot, and Bybit
+  linear perpetuals;
 - durable SQLite/WAL events with source provenance and measured receive latency;
 - API access and a realtime WebSocket for events and classifications;
 - deterministic replay through the same bounded classifiers used live;
-- stablecoin peg and short-horizon momentum shadow classifiers;
+- stablecoin peg (USDT, USDC, PYUSD, DAI, USDe, FDUSD, with stablecoin-quoted pairs converted to
+  USD) and short-horizon momentum shadow classifiers, each emitting at most once per second per
+  instrument;
+- automatic outcome labeling from replayed history and stored per-classifier evaluation runs;
 - promotion metrics and gates for accuracy, calibration, false alerts, coverage, and latency.
 
 See `docs/ARCHITECTURE.md` for the trust boundaries and production gaps.

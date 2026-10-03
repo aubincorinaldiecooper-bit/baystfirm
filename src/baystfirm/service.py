@@ -109,8 +109,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         gate = PromotionGate()
         return {
             "status": "shadow",
-            "promotion_eligible": False,
-            "reason": "no validated evaluation run has been registered",
+            "promotion": "manual approval required after an eligible run",
+            "runs": await runtime.store.latest_evaluation_runs(),
             "thresholds": {
                 "minimum_samples": gate.minimum_samples,
                 "minimum_coverage": gate.minimum_coverage,

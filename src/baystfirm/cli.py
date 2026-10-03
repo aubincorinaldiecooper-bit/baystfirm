@@ -9,8 +9,14 @@ from pathlib import Path
 import uvicorn
 
 from baystfirm.classifiers import MarketStateClassifier
-from baystfirm.evaluation import EvaluationRecord, PromotionGate, evaluate
-from baystfirm.models import MarketEvent
+from baystfirm.evaluation import (
+    EvaluationRecord,
+    PromotionGate,
+    evaluate,
+    evaluate_by_classifier,
+    label_classifications,
+)
+from baystfirm.models import Classification, MarketEvent
 from baystfirm.replay import ReplayRunner
 from baystfirm.storage import EventStore
 
@@ -36,6 +42,13 @@ def main() -> None:
     )
     evaluation.add_argument("records", type=Path)
 
+    replay_evaluation = subparsers.add_parser(
+        "evaluate-replay",
+        help="Replay stored events, label outcomes, evaluate, and record the run.",
+    )
+    replay_evaluation.add_argument("--database", default="var/baystfirm.db", type=Path)
+    replay_evaluation.add_argument("--tolerance-seconds", default=5.0, type=float)
+
     args = parser.parse_args()
     if args.command is None:
         args.host = "127.0.0.1"
@@ -48,6 +61,8 @@ def main() -> None:
         asyncio.run(_replay(args))
     elif args.command == "evaluate":
         _evaluate(args.records)
+    elif args.command == "evaluate-replay":
+        print(json.dumps(asyncio.run(_evaluate_replay(args)), indent=2))
 
 
 def _serve(args: argparse.Namespace) -> None:
@@ -78,6 +93,49 @@ async def _replay(args: argparse.Namespace) -> None:
     finally:
         await store.close()
     print(json.dumps({"replayed_events": count}))
+
+
+async def _evaluate_replay(args: argparse.Namespace) -> dict[str, object]:
+    store = EventStore(args.database)
+    await store.open()
+    classifier = MarketStateClassifier(shadow=True)
+    predictions: list[Classification] = []
+    first: MarketEvent | None = None
+    last: MarketEvent | None = None
+
+    async def classify(event: MarketEvent) -> None:
+        nonlocal first, last
+        first = first or event
+        last = event
+        predictions.extend(classifier.observe(event))
+
+    gate = PromotionGate()
+    report: dict[str, object] = {}
+    try:
+        event_count = await ReplayRunner(store).run(classify)
+        records = label_classifications(predictions, tolerance_seconds=args.tolerance_seconds)
+        dataset = {
+            "events": event_count,
+            "predictions": len(predictions),
+            "labeled_records": len(records),
+            "start": first.exchange_timestamp.isoformat() if first else None,
+            "end": last.exchange_timestamp.isoformat() if last else None,
+            "labeling": "same-classifier observed state one horizon later",
+        }
+        report["dataset"] = dataset
+        for name, metrics in evaluate_by_classifier(records).items():
+            failures = gate.failures(metrics)
+            run = {
+                "metrics": asdict(metrics),
+                "promotion_eligible": not failures,
+                "failures": failures,
+                "dataset": dataset,
+            }
+            run["run_id"] = await store.append_evaluation_run(name, run)
+            report[name] = run
+    finally:
+        await store.close()
+    return report
 
 
 def _evaluate(path: Path) -> None:

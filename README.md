@@ -179,6 +179,8 @@ Cards show sourced, timestamped facts from standard Solana JSON-RPC calls, DEX S
 GeckoTerminal liquidity cross-checks, and the Raydium pool API. RPC is limited to 4 requests/s
 (largest-account requests to 1 per 2 seconds); DEX Screener to 4/s, GeckoTerminal to 1 per 2.5s,
 Raydium to 2/s, and RugCheck to 1/s.
+Market facts include the selected main pool's price/liquidity/volume plus all-pool count, total
+liquidity, total 24-hour volume, and the time of the full pool read.
 
 Our on-chain checks are presented first. RugCheck is explicitly a second opinion; Baystfirm does
 not issue an overall safe/unsafe verdict and does not provide wallets or trade execution. The RPC

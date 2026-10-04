@@ -265,7 +265,7 @@ def test_main_pool_uses_highest_liquidity_and_missing_liquidity_is_zero() -> Non
     pairs = parse_dex_pairs(body, MINT)
     assert len(pairs) == 2
     assert select_main_pool(pairs) == body[1]
-    value = market_value(pairs)
+    value = market_value(pairs, pools_checked_at="2026-10-04T00:00:00+00:00")
     assert value is not None
     assert value["main_pool"] == {"dex": "raydium", "address": "main", "labels": ["CPMM"]}
     assert value["price_usd"] == 2.5
@@ -273,6 +273,9 @@ def test_main_pool_uses_highest_liquidity_and_missing_liquidity_is_zero() -> Non
     assert value["volume_24h_usd"] == 75
     assert value["price_change_24h_pct"] == -1.5
     assert value["pool_count"] == 2
+    assert value["total_liquidity_usd"] == 25
+    assert value["total_volume_24h_usd"] == 75
+    assert value["pools_checked_at"] == "2026-10-04T00:00:00+00:00"
 
 
 @pytest.mark.asyncio
@@ -441,6 +444,195 @@ async def test_rugcheck_failure_does_not_hide_other_card_facts() -> None:
     assert card.facts.market.value["geckoterminal_liquidity_usd"] == 1200
     assert card.facts.liquidity_lock.status == "not_applicable"
     assert card.second_opinion.status == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_full_card_uses_all_pools_for_market_and_holder_classification() -> None:
+    pairs = [
+        {
+            "baseToken": {"address": MINT, "name": "Bonk", "symbol": "BONK"},
+            "pairAddress": "pool-a",
+            "dexId": "pumpfun",
+            "labels": [],
+            "liquidity": {"usd": 100},
+            "volume": {"h24": 10},
+        },
+        {
+            "baseToken": {"address": MINT, "name": "Bonk", "symbol": "BONK"},
+            "pairAddress": "pool-b",
+            "dexId": "raydium",
+            "labels": ["CPMM"],
+            "priceUsd": "2",
+            "liquidity": {"usd": 400},
+            "volume": {"h24": 40},
+        },
+        {
+            "baseToken": {"address": MINT, "name": "Bonk", "symbol": "BONK"},
+            "pairAddress": "pool-c",
+            "dexId": "orca",
+            "labels": ["wp"],
+            "liquidity": {"usd": 200},
+            "volume": {"h24": 20},
+        },
+    ]
+    accounts = [
+        {"address": "account-a", "uiAmountString": "40"},
+        {"address": "account-b", "uiAmountString": "30"},
+        {"address": "account-c", "uiAmountString": "20"},
+        {"address": "account-wallet", "uiAmountString": "10"},
+    ]
+    owners = ["pool-a", "pool-b", "pool-c", "wallet"]
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "rpc.example.invalid":
+            payload = json.loads(request.read())
+            method = payload["method"]
+            if method == "getAccountInfo":
+                account = (
+                    {
+                        "owner": SPL_TOKEN_PROGRAM,
+                        "data": {
+                            "parsed": {
+                                "info": {
+                                    "mintAuthority": None,
+                                    "freezeAuthority": None,
+                                    "extensions": [],
+                                }
+                            }
+                        },
+                    }
+                    if payload["params"][0] == MINT
+                    else None
+                )
+                result: Any = {"value": account}
+            elif method == "getTokenLargestAccounts":
+                result = {"value": accounts}
+            elif method == "getTokenSupply":
+                result = {"value": {"uiAmountString": "100"}}
+            else:
+                result = {"value": [_token_account(owner) for owner in owners]}
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": payload["id"], "result": result},
+            )
+        if request.url.host == "api.dexscreener.com":
+            assert request.url.path == f"/token-pairs/v1/solana/{MINT}"
+            return httpx.Response(200, json=pairs)
+        if request.url.host == "api.geckoterminal.com":
+            return httpx.Response(
+                200,
+                json={"data": {"attributes": {"reserve_in_usd": "390"}}},
+            )
+        if request.url.host == "api-v3.raydium.io":
+            return httpx.Response(200, json={"data": [{"burnPercent": 99.5}]})
+        if request.url.host == "api.rugcheck.xyz":
+            return httpx.Response(500)
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        checker = SolanaTokenClient(_settings(), http, rate_limits=RATE_LIMITS_OFF)
+        card = await SolanaTokenEngine(checker).build_card(MINT)
+
+    market = card.facts.market.value
+    assert market["pool_count"] == 3
+    assert market["main_pool"]["address"] == "pool-b"
+    assert market["total_liquidity_usd"] == 700
+    assert market["total_volume_24h_usd"] == 70
+    assert market["pools_checked_at"]
+    assert card.facts.liquidity_lock.value["pool"] == "pool-b"
+    assert card.facts.top10_share.value["pct"] == 10.0
+    assert card.facts.top10_share.value["holders"] == [
+        {"owner": "pool-a", "pct": 40.0, "is_pool": True},
+        {"owner": "pool-b", "pct": 30.0, "is_pool": True},
+        {"owner": "pool-c", "pct": 20.0, "is_pool": True},
+        {"owner": "wallet", "pct": 10.0, "is_pool": False},
+    ]
+    assert any(request.url.path == f"/token-pairs/v1/solana/{MINT}" for request in requests)
+
+
+@pytest.mark.asyncio
+async def test_market_refresh_preserves_full_pool_totals_and_unions_pool_addresses() -> None:
+    previous_check = "2026-10-04T00:00:00+00:00"
+    previous_market = {
+        "price_usd": 1.0,
+        "liquidity_usd": 400,
+        "volume_24h_usd": 40,
+        "price_change_24h_pct": 1.0,
+        "pool_created_at": None,
+        "pool_count": 3,
+        "total_liquidity_usd": 700,
+        "total_volume_24h_usd": 70,
+        "pools_checked_at": previous_check,
+        "main_pool": {"dex": "raydium", "address": "old-main", "labels": ["CPMM"]},
+        "geckoterminal_liquidity_usd": 390,
+    }
+    new_pair = {
+        "baseToken": {"address": MINT, "name": "Bonk", "symbol": "BONK"},
+        "pairAddress": "new-main",
+        "dexId": "raydium",
+        "labels": ["CPMM"],
+        "priceUsd": "2",
+        "liquidity": {"usd": 900},
+        "volume": {"h24": 90},
+    }
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "api.dexscreener.com":
+            assert request.url.path == f"/tokens/v1/solana/{MINT}"
+            return httpx.Response(200, json=[new_pair])
+        if request.url.host == "api-v3.raydium.io":
+            return httpx.Response(200, json={"data": [{"burnPercent": 80.0}]})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        checker = SolanaTokenClient(_settings(), http, rate_limits=RATE_LIMITS_OFF)
+        engine = SolanaTokenEngine(checker)
+        card = solana_module._pending_card(MINT, "Bonk", "BONK", previous_check)
+        facts = card.facts.model_copy(
+            update={
+                "market": solana_module.Fact(
+                    status="ok",
+                    value=previous_market,
+                    source="dexscreener",
+                    fetched_at=previous_check,
+                ),
+                "liquidity_lock": solana_module.Fact(
+                    status="ok",
+                    value={
+                        "pool_type": "lp_token",
+                        "dex": "raydium",
+                        "pool": "old-main",
+                        "burned_pct": 99.0,
+                    },
+                    source="raydium",
+                    fetched_at=previous_check,
+                ),
+            }
+        )
+        engine.tokens[MINT] = card.model_copy(update={"facts": facts})
+        engine._pool_addresses[MINT] = {"pool-a", "old-main", "pool-c"}
+
+        await engine.refresh_markets_once()
+
+    refreshed = engine.tokens[MINT]
+    market = refreshed.facts.market.value
+    assert market["main_pool"]["address"] == "new-main"
+    assert market["liquidity_usd"] == 900
+    assert market["volume_24h_usd"] == 90
+    assert market["pool_count"] == 3
+    assert market["total_liquidity_usd"] == 700
+    assert market["total_volume_24h_usd"] == 70
+    assert market["pools_checked_at"] == previous_check
+    assert engine._pool_addresses[MINT] == {"pool-a", "old-main", "pool-c", "new-main"}
+    assert refreshed.facts.liquidity_lock.value["pool"] == "new-main"
+    raydium_request = next(
+        request for request in requests if request.url.host == "api-v3.raydium.io"
+    )
+    assert raydium_request.url.params["ids"] == "new-main"
 
 
 @pytest.mark.asyncio

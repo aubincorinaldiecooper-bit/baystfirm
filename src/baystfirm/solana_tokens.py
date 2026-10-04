@@ -63,6 +63,7 @@ SOURCE_RATE_LIMITS = {
     "rugcheck": 1.0,
 }
 DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/tokens/v1/solana"
+DEXSCREENER_TOKEN_PAIRS_URL = "https://api.dexscreener.com/token-pairs/v1/solana"
 GECKOTERMINAL_NEW_POOLS_URL = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
 GECKOTERMINAL_POOLS_URL = "https://api.geckoterminal.com/api/v2/networks/solana/pools"
 RAYDIUM_POOL_INFO_URL = "https://api-v3.raydium.io/pools/info/ids"
@@ -206,6 +207,12 @@ def _pair_liquidity(pair: Mapping[str, Any]) -> float:
     return _optional_float(value) or 0.0
 
 
+def _pair_volume_24h(pair: Mapping[str, Any]) -> float:
+    volume = pair.get("volume")
+    value = volume.get("h24") if isinstance(volume, Mapping) else None
+    return _optional_float(value) or 0.0
+
+
 def parse_dex_pairs(body: Any, mint: str) -> list[dict[str, Any]]:
     if not isinstance(body, list):
         return []
@@ -256,6 +263,7 @@ def market_value(
     pairs: list[dict[str, Any]],
     *,
     geckoterminal_liquidity_usd: float | None = None,
+    pools_checked_at: str | None = None,
 ) -> dict[str, Any] | None:
     main = select_main_pool(pairs)
     if main is None:
@@ -276,6 +284,9 @@ def market_value(
         ),
         "pool_created_at": _iso_from_milliseconds(main.get("pairCreatedAt")),
         "pool_count": len(pairs),
+        "total_liquidity_usd": sum(_pair_liquidity(pair) for pair in pairs),
+        "total_volume_24h_usd": sum(_pair_volume_24h(pair) for pair in pairs),
+        "pools_checked_at": pools_checked_at,
         "main_pool": {
             "dex": str(main.get("dexId") or "unknown"),
             "address": str(main.get("pairAddress") or ""),
@@ -396,6 +407,13 @@ class SolanaTokenClient:
                 results[mint] = parse_dex_pairs(body, mint)
         return results
 
+    async def get_token_pairs(self, mint: str) -> list[dict[str, Any]]:
+        body = await self.get_json(
+            "dexscreener",
+            f"{DEXSCREENER_TOKEN_PAIRS_URL}/{mint}",
+        )
+        return parse_dex_pairs(body, mint)
+
     async def gecko_liquidity(self, pool_address: str) -> float | None:
         body = await self.get_json(
             "geckoterminal",
@@ -414,11 +432,11 @@ class SolanaTokenClient:
         gecko_cross_check: bool,
     ) -> tuple[Fact, Fact, list[dict[str, Any]], str | None, str | None]:
         try:
-            pairs_by_mint = await self.get_dex_pairs([mint])
+            pairs = await self.get_token_pairs(mint)
         except SourceError as error:
             unavailable = unavailable_fact("dexscreener", error.detail, fetched_at=_iso_now())
             return unavailable, unavailable, [], None, None
-        pairs = pairs_by_mint.get(mint, [])
+        pools_checked_at = _iso_now()
         main = select_main_pool(pairs)
         if main is None:
             unavailable = unavailable_fact(
@@ -434,7 +452,11 @@ class SolanaTokenClient:
                 gecko_liquidity = await self.gecko_liquidity(pool_address)
             except SourceError:
                 gecko_liquidity = None
-        value = market_value(pairs, geckoterminal_liquidity_usd=gecko_liquidity)
+        value = market_value(
+            pairs,
+            geckoterminal_liquidity_usd=gecko_liquidity,
+            pools_checked_at=pools_checked_at,
+        )
         base = main.get("baseToken")
         name = base.get("name") if isinstance(base, Mapping) else None
         symbol = base.get("symbol") if isinstance(base, Mapping) else None
@@ -1048,8 +1070,14 @@ class SolanaTokenEngine:
                         "No trading pool found yet",
                         fetched_at=_iso_now(),
                     )
-                    self._pool_addresses[mint] = set()
                 else:
+                    for field in (
+                        "pool_count",
+                        "total_liquidity_usd",
+                        "total_volume_24h_usd",
+                        "pools_checked_at",
+                    ):
+                        market[field] = old_market_value.get(field)
                     market_fact = Fact(
                         status="ok",
                         value=market,
@@ -1063,7 +1091,7 @@ class SolanaTokenEngine:
                         lock_fact = old_card.facts.liquidity_lock
                     else:
                         lock_fact = await self.checker.liquidity_lock(main)
-                    self._pool_addresses[mint] = {
+                    self._pool_addresses[mint] = self._pool_addresses.get(mint, set()) | {
                         str(pair["pairAddress"])
                         for pair in pairs
                         if isinstance(pair.get("pairAddress"), str)

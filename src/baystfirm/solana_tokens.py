@@ -18,7 +18,7 @@ import httpx
 from pydantic import BaseModel
 from solders.pubkey import Pubkey
 
-from baystfirm.config import Settings
+from baystfirm.config import DEFAULT_SOLANA_RPC_URL, Settings
 
 logger = logging.getLogger(__name__)
 FactStatus = Literal["ok", "unavailable", "not_applicable"]
@@ -62,10 +62,14 @@ SOURCE_RATE_LIMITS = {
     "raydium": 0.5,
     "rugcheck": 1.0,
 }
+TOP_HOLDER_RETRY_SECONDS = 600
+MAX_TOP_HOLDER_ATTEMPTS = 6
 DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/tokens/v1/solana"
 DEXSCREENER_TOKEN_PAIRS_URL = "https://api.dexscreener.com/token-pairs/v1/solana"
+DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
 GECKOTERMINAL_NEW_POOLS_URL = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
 GECKOTERMINAL_POOLS_URL = "https://api.geckoterminal.com/api/v2/networks/solana/pools"
+GECKOTERMINAL_TOKEN_INFO_URL = "https://api.geckoterminal.com/api/v2/networks/solana/tokens"
 RAYDIUM_POOL_INFO_URL = "https://api-v3.raydium.io/pools/info/ids"
 RUGCHECK_SUMMARY_URL = "https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
 POOL_TYPE_RULES: tuple[tuple[str, frozenset[str], PoolType], ...] = (
@@ -225,6 +229,76 @@ def parse_dex_pairs(body: Any, mint: str) -> list[dict[str, Any]]:
             continue
         pairs.append(pair)
     return pairs
+
+
+def parse_dex_search(body: Any, query: str) -> list[dict[str, Any]]:
+    raw_pairs = body.get("pairs") if isinstance(body, Mapping) else None
+    if not isinstance(raw_pairs, list):
+        return []
+    pairs_by_mint: dict[str, list[dict[str, Any]]] = {}
+    for pair in raw_pairs:
+        if not isinstance(pair, dict) or pair.get("chainId") != "solana":
+            continue
+        base_token = pair.get("baseToken")
+        mint = base_token.get("address") if isinstance(base_token, Mapping) else None
+        if isinstance(mint, str):
+            pairs_by_mint.setdefault(mint, []).append(pair)
+
+    query_key = query.casefold()
+    results: list[dict[str, Any]] = []
+    for mint, pairs in pairs_by_mint.items():
+        main = select_main_pool(pairs)
+        if main is None:
+            continue
+        base_token = main.get("baseToken")
+        base_token = base_token if isinstance(base_token, Mapping) else {}
+        info = main.get("info")
+        info = info if isinstance(info, Mapping) else {}
+        symbol = _optional_string(base_token.get("symbol"))
+        results.append(
+            {
+                "mint": mint,
+                "symbol": symbol,
+                "name": _optional_string(base_token.get("name")),
+                "image": _optional_string(info.get("imageUrl")),
+                "pool_count": len(pairs),
+                "total_liquidity_usd": sum(_pair_liquidity(pair) for pair in pairs),
+                "volume_24h_usd": sum(_pair_volume_24h(pair) for pair in pairs),
+                "main_pool_address": _optional_string(main.get("pairAddress")),
+                "price_usd": _optional_float(main.get("priceUsd")),
+                "symbol_match": symbol is not None and symbol.casefold() == query_key,
+            }
+        )
+    return sorted(
+        results,
+        key=lambda item: float(item["total_liquidity_usd"]),
+        reverse=True,
+    )[:10]
+
+
+def parse_geckoterminal_holders(body: Any) -> dict[str, Any] | None:
+    data = body.get("data") if isinstance(body, Mapping) else None
+    attributes = data.get("attributes") if isinstance(data, Mapping) else None
+    holders = attributes.get("holders") if isinstance(attributes, Mapping) else None
+    if not isinstance(holders, Mapping):
+        return None
+    distribution = holders.get("distribution_percentage")
+    top_10 = (
+        _optional_float(distribution.get("top_10")) if isinstance(distribution, Mapping) else None
+    )
+    if top_10 is None:
+        return None
+    holder_count = holders.get("count")
+    if isinstance(holder_count, bool) or not isinstance(holder_count, int):
+        holder_count = None
+    as_of = holders.get("last_updated")
+    return {
+        "pct": top_10,
+        "holder_count": holder_count,
+        "as_of": as_of if isinstance(as_of, str) else None,
+        "pool_accounts_excluded": False,
+        "holders": [],
+    }
 
 
 def select_main_pool(pairs: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -414,6 +488,33 @@ class SolanaTokenClient:
         )
         return parse_dex_pairs(body, mint)
 
+    async def search_tokens(self, query: str) -> list[dict[str, Any]]:
+        body = await self.get_json(
+            "dexscreener",
+            DEXSCREENER_SEARCH_URL,
+            params={"q": query},
+        )
+        return parse_dex_search(body, query)
+
+    async def get_geckoterminal_ohlcv(
+        self,
+        pool_address: str,
+        mint: str,
+        timeframe: str,
+        aggregate: int,
+        limit: int,
+    ) -> Any:
+        return await self.get_json(
+            "geckoterminal",
+            f"{GECKOTERMINAL_POOLS_URL}/{pool_address}/ohlcv/{timeframe}",
+            params={
+                "aggregate": aggregate,
+                "limit": limit,
+                "currency": "usd",
+                "token": mint,
+            },
+        )
+
     async def gecko_liquidity(self, pool_address: str) -> float | None:
         body = await self.get_json(
             "geckoterminal",
@@ -545,6 +646,8 @@ class SolanaTokenClient:
         )
 
     async def top10_share(self, mint: str, pool_addresses: set[str]) -> Fact:
+        if self.settings.solana_rpc_url == DEFAULT_SOLANA_RPC_URL:
+            return await self.geckoterminal_top10_share(mint)
         try:
             largest_result = await self.rpc(
                 "getTokenLargestAccounts",
@@ -609,11 +712,42 @@ class SolanaTokenClient:
             non_pool = [holder for holder in holder_rows if not holder["is_pool"]][:10]
             value = {
                 "pct": sum(float(holder["pct"]) for holder in non_pool),
+                "pool_accounts_excluded": True,
+                "holder_count": None,
+                "as_of": None,
                 "holders": holder_rows,
             }
             return Fact(status="ok", value=value, source="solana_rpc", fetched_at=_iso_now())
+        except SourceError:
+            return await self.geckoterminal_top10_share(mint)
+
+    async def geckoterminal_top10_share(self, mint: str) -> Fact:
+        try:
+            body = await self.get_json(
+                "geckoterminal",
+                f"{GECKOTERMINAL_TOKEN_INFO_URL}/{mint}/info",
+            )
         except SourceError as error:
-            return unavailable_fact("solana_rpc", error.detail, fetched_at=_iso_now())
+            return unavailable_fact(
+                "geckoterminal",
+                error.detail,
+                fetched_at=_iso_now(),
+            )
+        fetched_at = _iso_now()
+        value = parse_geckoterminal_holders(body)
+        if value is None:
+            return unavailable_fact(
+                "geckoterminal",
+                "No holder data from GeckoTerminal yet",
+                fetched_at=fetched_at,
+            )
+        return Fact(
+            status="ok",
+            value=value,
+            source="geckoterminal",
+            fetched_at=fetched_at,
+            detail="Top 10 holders per GeckoTerminal; may include pool and exchange accounts",
+        )
 
     async def rugcheck(self, mint: str) -> SecondOpinion:
         headers = (
@@ -973,6 +1107,7 @@ class SolanaTokenEngine:
         self._checked_at: dict[str, float | None] = {}
         self._pool_addresses: dict[str, set[str]] = {}
         self._top_retry_count: dict[str, int] = {}
+        self._top_retry_at: dict[str, float] = {}
         self._rug_retry_at: dict[str, float] = {}
         self._rug_retry_attempted: set[str] = set()
         self._queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
@@ -1014,6 +1149,7 @@ class SolanaTokenEngine:
                 self._checked_at.pop(expired_mint, None)
                 self._pool_addresses.pop(expired_mint, None)
                 self._top_retry_count.pop(expired_mint, None)
+                self._top_retry_at.pop(expired_mint, None)
                 self._rug_retry_at.pop(expired_mint, None)
                 self._rug_retry_attempted.discard(expired_mint)
             self.checker._mark_success("geckoterminal")
@@ -1100,13 +1236,20 @@ class SolanaTokenEngine:
 
     def schedule_retries(self, *, max_top_holder_retries: int = 10) -> None:
         now = monotonic()
-        scheduled_top_retries = 0
+        scheduled_top_retries = sum(kind == "top10" for kind, _ in self._queued)
         for mint, card in self.tokens.items():
+            top_fact = card.facts.top10_share
+            retry_at = self._top_retry_at.get(mint)
+            retry_due = (
+                self._top_retry_count.get(mint, 0) == 0 if retry_at is None else now >= retry_at
+            )
             if (
-                card.facts.top10_share.status == "unavailable"
-                and card.facts.top10_share.detail != "Check pending"
-                and self._top_retry_count.get(mint, 0) < max_top_holder_retries
+                top_fact.status == "unavailable"
+                and top_fact.detail != "Address is not a token mint."
+                and retry_due
+                and self._top_retry_count.get(mint, 0) < MAX_TOP_HOLDER_ATTEMPTS
                 and scheduled_top_retries < max_top_holder_retries
+                and ("top10", mint) not in self._queued
             ):
                 self._queue_work("top10", mint)
                 scheduled_top_retries += 1
@@ -1129,27 +1272,37 @@ class SolanaTokenEngine:
                         card = await self.build_card(
                             mint,
                             first_seen_at=existing.first_seen_at,
-                            gecko_cross_check=True,
+                            gecko_cross_check=False,
+                            fetch_top10=False,
                         )
                     except NotTokenMint:
                         self._update_all_unavailable(mint, "Address is not a token mint.")
                         continue
                     self._store_card(card, checked=True)
-                    if card.facts.top10_share.status == "unavailable":
-                        self._top_retry_count.setdefault(mint, 0)
                     if card.second_opinion.status == "unavailable":
                         self._rug_retry_at[mint] = monotonic() + 600
                     else:
                         self._rug_retry_at.pop(mint, None)
                 elif kind == "top10":
                     stored_card = self.tokens.get(mint)
-                    if stored_card is None or stored_card.facts.top10_share.status != "unavailable":
+                    if (
+                        stored_card is None
+                        or self._checked_at.get(mint) is None
+                        or stored_card.facts.top10_share.status != "unavailable"
+                    ):
                         continue
-                    self._top_retry_count[mint] = self._top_retry_count.get(mint, 0) + 1
                     fact = await self.checker.top10_share(
                         mint,
                         self._pool_addresses.get(mint, set()),
                     )
+                    attempts = self._top_retry_count.get(mint, 0) + 1
+                    self._top_retry_count[mint] = attempts
+                    if fact.status == "unavailable" and attempts < MAX_TOP_HOLDER_ATTEMPTS:
+                        self._top_retry_at[mint] = monotonic() + TOP_HOLDER_RETRY_SECONDS
+                    else:
+                        self._top_retry_at.pop(mint, None)
+                        if fact.status == "ok":
+                            self._top_retry_count.pop(mint, None)
                     self._update_facts(mint, top10_share=fact)
                 elif kind == "rugcheck":
                     stored_card = self.tokens.get(mint)
@@ -1172,10 +1325,16 @@ class SolanaTokenEngine:
                 if kind == "card":
                     self._update_all_unavailable(mint, "Couldn't check right now")
                 elif kind == "top10":
+                    attempts = self._top_retry_count.get(mint, 0) + 1
+                    self._top_retry_count[mint] = attempts
+                    if attempts < MAX_TOP_HOLDER_ATTEMPTS:
+                        self._top_retry_at[mint] = monotonic() + TOP_HOLDER_RETRY_SECONDS
+                    else:
+                        self._top_retry_at.pop(mint, None)
                     self._update_facts(
                         mint,
                         top10_share=unavailable_fact(
-                            "solana_rpc",
+                            "geckoterminal",
                             "Couldn't check right now",
                             fetched_at=_iso_now(),
                         ),
@@ -1203,6 +1362,7 @@ class SolanaTokenEngine:
         *,
         first_seen_at: str | None = None,
         gecko_cross_check: bool = True,
+        fetch_top10: bool = True,
         fetch_rugcheck: bool = True,
     ) -> TokenCard:
         validate_mint(mint)
@@ -1308,7 +1468,10 @@ class SolanaTokenEngine:
         }
         if existing is not None:
             self._pool_addresses[mint] = pool_addresses
-        facts["top10_share"] = await self.checker.top10_share(mint, pool_addresses)
+        if fetch_top10:
+            facts["top10_share"] = await self.checker.top10_share(mint, pool_addresses)
+        else:
+            facts["top10_share"] = unavailable_fact("geckoterminal", "Check pending")
         opinion = (
             await self.checker.rugcheck(mint)
             if fetch_rugcheck or existing is None
@@ -1378,6 +1541,12 @@ class SolanaTokenEngine:
             self.tokens[card.mint] = card
         if checked:
             self._checked_at[card.mint] = monotonic()
+        top_fact = card.facts.top10_share
+        if top_fact.status == "ok":
+            self._top_retry_count.pop(card.mint, None)
+            self._top_retry_at.pop(card.mint, None)
+        elif top_fact.detail != "Check pending":
+            self._top_retry_at.setdefault(card.mint, monotonic() + TOP_HOLDER_RETRY_SECONDS)
         if (
             card.second_opinion.status == "unavailable"
             and card.mint not in self._rug_retry_attempted

@@ -11,7 +11,12 @@ import baystfirm.service as service_module
 from baystfirm.config import Settings
 from baystfirm.models import Candle
 from baystfirm.service import create_app
-from baystfirm.solana_tokens import NotTokenMint, SolanaTokenClient, SolanaTokenEngine
+from baystfirm.solana_tokens import (
+    NotTokenMint,
+    SolanaTokenClient,
+    SolanaTokenEngine,
+    SourceError,
+)
 from tests.test_classifiers import stablecoin_trade
 
 
@@ -54,7 +59,14 @@ def test_api_key_guards_v1_routes(tmp_path: Path) -> None:
         assert client.get("/v1/snapshot").status_code == 401
         assert client.get("/v1/track-record").status_code == 401
         assert client.get("/v1/track-record/backtest").status_code == 401
+        assert client.get("/v1/solana/search?q=BONK").status_code == 401
         assert client.get("/v1/solana/tokens/new").status_code == 401
+        assert (
+            client.get(
+                "/v1/solana/tokens/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263/candles?interval=1h"
+            ).status_code
+            == 401
+        )
         assert (
             client.get("/v1/solana/tokens/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263").status_code
             == 401
@@ -380,6 +392,298 @@ def test_candles_route_rejects_invalid_or_excessive_indicator_specs(
         params.extend(("indicator", "sma:2") for _ in range(7))
         excessive = client.get("/v1/candles", params=params)
         assert excessive.status_code == 422
+
+
+def test_solana_search_groups_sorts_and_caches_casefolded_queries(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    bonk_mint = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+    other_mint = str(Pubkey.new_unique())
+    pairs = [
+        {
+            "chainId": "solana",
+            "baseToken": {"address": bonk_mint, "symbol": "BONK", "name": "Bonk"},
+            "pairAddress": "bonk-low",
+            "priceUsd": "0.00001",
+            "liquidity": {"usd": 100},
+            "volume": {"h24": 11},
+            "info": {"imageUrl": "https://example.invalid/bonk-low.png"},
+        },
+        {
+            "chainId": "solana",
+            "baseToken": {"address": bonk_mint, "symbol": "BONK", "name": "Bonk"},
+            "pairAddress": "bonk-high",
+            "priceUsd": "0.00003",
+            "liquidity": {"usd": 300},
+            "volume": {"h24": 22},
+            "info": {"imageUrl": "https://example.invalid/bonk.png"},
+        },
+        {
+            "chainId": "solana",
+            "baseToken": {"address": other_mint, "symbol": "OTHER", "name": "Other"},
+            "pairAddress": "other-pool",
+            "priceUsd": "2.5",
+            "liquidity": {"usd": 500},
+            "volume": {"h24": 55},
+        },
+        {
+            "chainId": "ethereum",
+            "baseToken": {"address": str(Pubkey.new_unique()), "symbol": "BONK"},
+            "pairAddress": "not-solana",
+            "liquidity": {"usd": 1_000_000},
+            "volume": {"h24": 1_000_000},
+        },
+    ]
+    calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+    async def get_json(source, url, *, params=None, headers=None):
+        calls.append((source, url, params))
+        return {"pairs": pairs}
+
+    app = _strategy_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        checker = app.state.runtime.solana_tokens.checker
+        monkeypatch.setattr(checker, "get_json", get_json)
+        first = client.get("/v1/solana/search", params={"q": " BONK "})
+        second = client.get("/v1/solana/search", params={"q": "bonk"})
+        invalid = client.get("/v1/solana/search", params={"q": "  "})
+        overlong = client.get("/v1/solana/search", params={"q": "x" * 33})
+
+    assert first.status_code == 200
+    body = first.json()
+    assert [token["mint"] for token in body["tokens"]] == [other_mint, bonk_mint]
+    bonk = body["tokens"][1]
+    assert bonk == {
+        "mint": bonk_mint,
+        "symbol": "BONK",
+        "name": "Bonk",
+        "image": "https://example.invalid/bonk.png",
+        "pool_count": 2,
+        "total_liquidity_usd": 400.0,
+        "volume_24h_usd": 33.0,
+        "main_pool_address": "bonk-high",
+        "price_usd": 3e-05,
+        "symbol_match": True,
+    }
+    assert body["source"] == "dexscreener"
+    assert "not an endorsement" in body["note"]
+    assert second.status_code == 200
+    assert second.json()["query"] == "bonk"
+    assert len(calls) == 1
+    assert calls[0][0] == "dexscreener"
+    assert calls[0][1] == "https://api.dexscreener.com/latest/dex/search"
+    assert calls[0][2] == {"q": "BONK"}
+    assert invalid.status_code == 422
+    assert overlong.status_code == 422
+
+
+def test_solana_search_upstream_error_returns_502(tmp_path: Path, monkeypatch) -> None:
+    async def get_json(source, url, *, params=None, headers=None):
+        raise SourceError("dexscreener", "Couldn't check right now")
+
+    app = _strategy_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        checker = app.state.runtime.solana_tokens.checker
+        monkeypatch.setattr(checker, "get_json", get_json)
+        response = client.get("/v1/solana/search?q=BONK")
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Couldn't check right now"
+
+
+def test_solana_token_candles_map_intervals_cache_and_add_indicators(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    mint = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+    pairs = [
+        {
+            "baseToken": {"address": mint, "symbol": "BONK"},
+            "pairAddress": "pool-low",
+            "dexId": "raydium",
+            "liquidity": {"usd": 100},
+        },
+        {
+            "baseToken": {"address": mint, "symbol": "BONK"},
+            "pairAddress": "pool-main",
+            "dexId": "orca",
+            "liquidity": {"usd": 500},
+        },
+    ]
+    candle_body = {
+        "data": {
+            "attributes": {
+                "ohlcv_list": [
+                    [1_730_000_060, 2.0, 2.5, 1.5, 2.0, 20.0],
+                    [1_730_000_000, 1.0, 2.0, 0.5, 1.5, 10.0],
+                ]
+            }
+        }
+    }
+    calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+    async def get_json(source, url, *, params=None, headers=None):
+        calls.append((source, url, params))
+        if source == "dexscreener":
+            return pairs
+        return candle_body
+
+    app = _strategy_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        checker = app.state.runtime.solana_tokens.checker
+        monkeypatch.setattr(checker, "get_json", get_json)
+        first = client.get(
+            f"/v1/solana/tokens/{mint}/candles",
+            params=[("interval", "1h"), ("limit", "2"), ("indicator", "sma:2")],
+        )
+        cached = client.get(
+            f"/v1/solana/tokens/{mint}/candles",
+            params=[("interval", "1h"), ("limit", "2")],
+        )
+        intervals = {
+            "1m": ("minute", 1),
+            "5m": ("minute", 5),
+            "15m": ("minute", 15),
+            "1h": ("hour", 1),
+            "4h": ("hour", 4),
+            "1d": ("day", 1),
+        }
+        interval_responses = {
+            interval: client.get(
+                f"/v1/solana/tokens/{mint}/candles",
+                params=[("interval", interval), ("limit", "2")],
+            )
+            for interval in intervals
+        }
+
+    assert first.status_code == 200
+    body = first.json()
+    assert body["venue"] == "geckoterminal"
+    assert body["symbol"] == "BONK"
+    assert body["interval"] == "1h"
+    assert body["source_url_template"] == "https://www.geckoterminal.com/solana/pools/{pool}"
+    assert body["aggregated_from"] is None
+    assert body["stale"] is False
+    assert body["truncated"] is False
+    assert body["mint"] == mint
+    assert body["pool_address"] == "pool-main"
+    assert body["dex_id"] == "orca"
+    assert body["price_currency"] == "usd"
+    assert [candle["open_time"] for candle in body["candles"]] == [
+        1_730_000_000_000,
+        1_730_000_060_000,
+    ]
+    assert [candle["volume"] for candle in body["candles"]] == [10, 20]
+    assert body["indicators"]["sma:2"]["value"] == [None, 1.75]
+    assert cached.status_code == 200
+    assert len(calls) == 7
+    assert calls[0][1] == ("https://api.dexscreener.com/token-pairs/v1/solana/" + mint)
+    gecko_calls = [call for call in calls if call[0] == "geckoterminal"]
+    assert {(call[1].rsplit("/", 1)[-1], call[2]["aggregate"]) for call in gecko_calls} == set(
+        intervals.values()
+    )
+    hourly = next(call for call in gecko_calls if call[1].endswith("/ohlcv/hour"))
+    assert hourly[2] == {
+        "aggregate": 1,
+        "limit": 2,
+        "currency": "usd",
+        "token": mint,
+    }
+    assert all(response.status_code == 200 for response in interval_responses.values())
+
+
+def test_solana_token_candles_no_pool_and_validation_errors(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app = _strategy_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        checker = app.state.runtime.solana_tokens.checker
+
+        async def empty_pairs(source, url, *, params=None, headers=None):
+            return []
+
+        monkeypatch.setattr(checker, "get_json", empty_pairs)
+        no_pool = client.get(
+            "/v1/solana/tokens/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263/candles",
+            params={"interval": "1h"},
+        )
+        invalid_mint = client.get("/v1/solana/tokens/not-a-mint/candles?interval=1h")
+        invalid_interval = client.get(
+            "/v1/solana/tokens/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263/candles?interval=2m"
+        )
+
+    assert no_pool.status_code == 404
+    assert no_pool.json()["detail"] == "No trading pool found for this token"
+    assert invalid_mint.status_code == 400
+    assert invalid_interval.status_code == 422
+
+
+def test_solana_token_candles_stale_cache_and_unavailable_response(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    mint = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+    pairs = [
+        {
+            "baseToken": {"address": mint, "symbol": "BONK"},
+            "pairAddress": "pool-main",
+            "dexId": "orca",
+            "liquidity": {"usd": 500},
+        }
+    ]
+    body = {
+        "data": {
+            "attributes": {
+                "ohlcv_list": [[1_730_000_000, 1, 2, 0.5, 1.5, 10]],
+            }
+        }
+    }
+    fail_gecko = False
+
+    async def get_json(source, url, *, params=None, headers=None):
+        if source == "dexscreener":
+            return pairs
+        if fail_gecko:
+            raise SourceError("geckoterminal", "Couldn't check right now (rate limited)")
+        return body
+
+    app = _strategy_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        checker = app.state.runtime.solana_tokens.checker
+        monkeypatch.setattr(checker, "get_json", get_json)
+        path = f"/v1/solana/tokens/{mint}/candles?interval=1h"
+        fresh = client.get(path)
+        cache_key = ("pool-main", "1h", 300)
+        cache_entry = app.state.runtime.solana_candle_cache[cache_key]
+        app.state.runtime.solana_candle_cache[cache_key] = (
+            service_module.monotonic() - service_module.SOLANA_CANDLE_CACHE_TTL_SECONDS - 1,
+            cache_entry[1],
+        )
+        fail_gecko = True
+        stale = client.get(path)
+
+    assert fresh.status_code == 200
+    assert stale.status_code == 200
+    assert stale.json()["stale"] is True
+
+    other_app = _strategy_app(tmp_path, monkeypatch)
+    with TestClient(other_app) as client:
+        checker = other_app.state.runtime.solana_tokens.checker
+
+        async def unavailable(source, url, *, params=None, headers=None):
+            if source == "dexscreener":
+                return pairs
+            raise SourceError("geckoterminal", "Couldn't check right now")
+
+        monkeypatch.setattr(checker, "get_json", unavailable)
+        failed = client.get(path)
+
+    assert failed.status_code == 502
+    assert failed.json()["detail"] == (
+        "GeckoTerminal is rate-limited or unavailable; try again shortly"
+    )
 
 
 def test_backtest_endpoint_requires_valid_bounds_and_known_symbols(

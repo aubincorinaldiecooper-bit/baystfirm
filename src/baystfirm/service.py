@@ -4,6 +4,7 @@ import asyncio
 import hmac
 import logging
 import math
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -53,6 +54,8 @@ from baystfirm.solana_tokens import (
     NotTokenMint,
     SolanaTokenClient,
     SolanaTokenEngine,
+    SourceError,
+    select_main_pool,
     validate_mint,
 )
 from baystfirm.sse import sse_frames
@@ -83,10 +86,27 @@ BACKTEST_CACHE_TTL_SECONDS = 60.0
 BACKTEST_CACHE_MAX_ENTRIES = 32
 SOLANA_TOKEN_REFRESH_SECONDS = 60
 SOLANA_TOKEN_WORKERS = 4
+SOLANA_SEARCH_CACHE_TTL_SECONDS = 30
+SOLANA_SEARCH_CACHE_MAX_ENTRIES = 256
+SOLANA_POOL_CACHE_TTL_SECONDS = 5 * 60
+SOLANA_POOL_CACHE_MAX_ENTRIES = 256
+SOLANA_CANDLE_CACHE_TTL_SECONDS = 60
+SOLANA_CANDLE_CACHE_MAX_ENTRIES = 256
+SOLANA_CANDLE_INTERVALS = {
+    "1m": ("minute", 1),
+    "5m": ("minute", 5),
+    "15m": ("minute", 15),
+    "1h": ("hour", 1),
+    "4h": ("hour", 4),
+    "1d": ("day", 1),
+}
 SOLANA_TOKENS_NOTE = (
     "Facts read from public sources at the times shown. Our own checks come first; RugCheck is "
     "shown as a second opinion. There is no overall safety verdict. Probabilities and facts, "
     "not investment advice."
+)
+SOLANA_SEARCH_NOTE = (
+    "Results are pools found by DEX Screener search; they are not an endorsement of any token."
 )
 
 
@@ -111,6 +131,15 @@ class Runtime:
     solana_tokens: SolanaTokenEngine | None = None
     solana_tokens_task: asyncio.Task[None] | None = None
     solana_http_client: httpx.AsyncClient | None = None
+    solana_search_cache: OrderedDict[str, tuple[float, str, list[dict[str, Any]]]] = field(
+        default_factory=OrderedDict
+    )
+    solana_pool_cache: OrderedDict[str, tuple[float, dict[str, Any] | None]] = field(
+        default_factory=OrderedDict
+    )
+    solana_candle_cache: OrderedDict[tuple[str, str, int], tuple[float, dict[str, Any]]] = field(
+        default_factory=OrderedDict
+    )
 
 
 def _authorized(expected: str | None, authorization: str | None) -> bool:
@@ -118,6 +147,61 @@ def _authorized(expected: str | None, authorization: str | None) -> bool:
         return True
     scheme, _, token = (authorization or "").partition(" ")
     return scheme.lower() == "bearer" and hmac.compare_digest(token.strip(), expected)
+
+
+def _parse_requested_indicators(indicator: list[str] | None) -> list[IndicatorSpec]:
+    if not indicator:
+        return []
+    if len(indicator) > 6:
+        raise HTTPException(
+            status_code=422,
+            detail="At most 6 indicator specs may be requested.",
+        )
+    try:
+        return [parse_indicator(value) for value in indicator]
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+def _apply_requested_indicators(
+    result: dict[str, Any],
+    specs: list[IndicatorSpec],
+) -> dict[str, Any]:
+    if not specs:
+        return result
+    candles = [Candle.model_validate(item) for item in result["candles"]]
+    result["indicators"] = {spec.key: compute_indicator(spec, candles) for spec in specs}
+    return result
+
+
+def _parse_geckoterminal_candles(body: Any, limit: int) -> list[dict[str, Any]]:
+    data = body.get("data") if isinstance(body, dict) else None
+    attributes = data.get("attributes") if isinstance(data, dict) else None
+    rows = attributes.get("ohlcv_list") if isinstance(attributes, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("GeckoTerminal did not return OHLCV rows.")
+    candles: list[dict[str, Any]] = []
+    for row in reversed(rows[:limit]):
+        if not isinstance(row, list) or len(row) < 6:
+            raise ValueError("GeckoTerminal returned an invalid OHLCV row.")
+        try:
+            timestamp, open_value, high, low, close, volume = (float(value) for value in row[:6])
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("GeckoTerminal returned an invalid OHLCV row.") from error
+        values = (timestamp, open_value, high, low, close, volume)
+        if not all(math.isfinite(value) for value in values) or not math.isfinite(timestamp * 1000):
+            raise ValueError("GeckoTerminal returned an invalid OHLCV row.")
+        candles.append(
+            Candle(
+                open_time=int(timestamp * 1000),
+                open=open_value,
+                high=high,
+                low=low,
+                close=close,
+                volume=volume,
+            ).model_dump(mode="json")
+        )
+    return candles
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -202,6 +286,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     v1 = APIRouter(prefix="/v1", dependencies=[Depends(require_api_key)])
 
+    def solana_checker() -> SolanaTokenClient:
+        if runtime.solana_tokens is not None:
+            return runtime.solana_tokens.checker
+        if runtime.solana_http_client is not None:
+            return SolanaTokenClient(runtime.settings, runtime.solana_http_client)
+        raise HTTPException(status_code=503, detail="Solana data client is unavailable.")
+
     @v1.get("/candles")
     async def candles(
         venue: str,
@@ -210,17 +301,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         limit: int = Query(default=300, ge=1, le=500),
         indicator: Annotated[list[str] | None, Query()] = None,
     ) -> dict[str, Any]:
-        specs: list[IndicatorSpec] = []
-        if indicator is not None:
-            if len(indicator) > 6:
-                raise HTTPException(
-                    status_code=422,
-                    detail="At most 6 indicator specs may be requested.",
-                )
-            try:
-                specs = [parse_indicator(value) for value in indicator]
-            except ValueError as error:
-                raise HTTPException(status_code=422, detail=str(error)) from error
+        specs = _parse_requested_indicators(indicator)
         try:
             result = await CandleService(runtime.settings, runtime.store).get(
                 venue, symbol, interval, limit
@@ -229,12 +310,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(error)) from error
         except CandleUnavailable as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
-        if specs:
-            closed_candles = [Candle.model_validate(item) for item in result["candles"]]
-            result["indicators"] = {
-                spec.key: compute_indicator(spec, closed_candles) for spec in specs
-            }
-        return result
+        return _apply_requested_indicators(result, specs)
 
     async def load_backtest_candles(
         venue: str, symbol: str, interval: str, bars: int
@@ -512,6 +588,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "note": BACKTEST_NOTE,
         }
 
+    @v1.get("/solana/search")
+    async def solana_search(q: str) -> dict[str, Any]:
+        query = q.strip()
+        if not 1 <= len(query) <= 32:
+            raise HTTPException(status_code=422, detail="Search query must be 1–32 characters.")
+        cache_key = query.casefold()
+        cached = runtime.solana_search_cache.get(cache_key)
+        now = monotonic()
+        if cached is not None and now - cached[0] < SOLANA_SEARCH_CACHE_TTL_SECONDS:
+            runtime.solana_search_cache.move_to_end(cache_key)
+            return {
+                "query": query,
+                "tokens": cached[2],
+                "source": "dexscreener",
+                "fetched_at": cached[1],
+                "note": SOLANA_SEARCH_NOTE,
+            }
+        try:
+            tokens = await solana_checker().search_tokens(query)
+        except SourceError as error:
+            raise HTTPException(status_code=502, detail=error.detail) from error
+        fetched_at = datetime.now(UTC).isoformat()
+        runtime.solana_search_cache[cache_key] = (monotonic(), fetched_at, tokens)
+        runtime.solana_search_cache.move_to_end(cache_key)
+        while len(runtime.solana_search_cache) > SOLANA_SEARCH_CACHE_MAX_ENTRIES:
+            runtime.solana_search_cache.popitem(last=False)
+        return {
+            "query": query,
+            "tokens": tokens,
+            "source": "dexscreener",
+            "fetched_at": fetched_at,
+            "note": SOLANA_SEARCH_NOTE,
+        }
+
     @v1.get("/solana/tokens/new")
     async def solana_new_tokens(
         limit: int = Query(default=50, ge=1, le=200),
@@ -530,6 +640,103 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "note": SOLANA_TOKENS_NOTE,
             }
         return {**engine.response(limit), "note": SOLANA_TOKENS_NOTE}
+
+    @v1.get("/solana/tokens/{mint}/candles")
+    async def solana_token_candles(
+        mint: str,
+        interval: str = Query(pattern="^(1m|5m|15m|1h|4h|1d)$"),
+        limit: int = Query(default=300, ge=1, le=500),
+        indicator: Annotated[list[str] | None, Query()] = None,
+    ) -> dict[str, Any]:
+        try:
+            validate_mint(mint)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        specs = _parse_requested_indicators(indicator)
+        checker = solana_checker()
+        pool_entry = runtime.solana_pool_cache.get(mint)
+        cached_main = pool_entry[1] if pool_entry is not None else None
+        now = monotonic()
+        if pool_entry is not None and now - pool_entry[0] < SOLANA_POOL_CACHE_TTL_SECONDS:
+            runtime.solana_pool_cache.move_to_end(mint)
+            main_pool = cached_main
+        else:
+            try:
+                pairs = await checker.get_token_pairs(mint)
+            except SourceError as error:
+                if cached_main is None:
+                    raise HTTPException(status_code=502, detail=error.detail) from error
+                main_pool = cached_main
+            else:
+                main_pool = select_main_pool(pairs)
+                runtime.solana_pool_cache[mint] = (monotonic(), main_pool)
+                runtime.solana_pool_cache.move_to_end(mint)
+                while len(runtime.solana_pool_cache) > SOLANA_POOL_CACHE_MAX_ENTRIES:
+                    runtime.solana_pool_cache.popitem(last=False)
+        if main_pool is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No trading pool found for this token",
+            )
+        pool_address = main_pool.get("pairAddress")
+        if not isinstance(pool_address, str) or not pool_address:
+            raise HTTPException(
+                status_code=404,
+                detail="No trading pool found for this token",
+            )
+        cache_key = (pool_address, interval, limit)
+        cached_candles = runtime.solana_candle_cache.get(cache_key)
+        now = monotonic()
+        if cached_candles is not None and now - cached_candles[0] < SOLANA_CANDLE_CACHE_TTL_SECONDS:
+            runtime.solana_candle_cache.move_to_end(cache_key)
+            result = dict(cached_candles[1])
+            result["stale"] = False
+            return _apply_requested_indicators(result, specs)
+
+        timeframe, aggregate = SOLANA_CANDLE_INTERVALS[interval]
+        try:
+            body = await checker.get_geckoterminal_ohlcv(
+                pool_address,
+                mint,
+                timeframe,
+                aggregate,
+                limit,
+            )
+            candle_rows = _parse_geckoterminal_candles(body, limit)
+        except (SourceError, ValueError) as error:
+            if cached_candles is not None:
+                runtime.solana_candle_cache.move_to_end(cache_key)
+                result = dict(cached_candles[1])
+                result["stale"] = True
+                return _apply_requested_indicators(result, specs)
+            raise HTTPException(
+                status_code=502,
+                detail="GeckoTerminal is rate-limited or unavailable; try again shortly",
+            ) from error
+
+        base_token = main_pool.get("baseToken")
+        base_token = base_token if isinstance(base_token, dict) else {}
+        symbol = base_token.get("symbol")
+        result = {
+            "venue": "geckoterminal",
+            "symbol": symbol if isinstance(symbol, str) and symbol else mint,
+            "interval": interval,
+            "source_url_template": "https://www.geckoterminal.com/solana/pools/{pool}",
+            "fetched_at": datetime.now(UTC).isoformat(),
+            "aggregated_from": None,
+            "candles": candle_rows,
+            "stale": False,
+            "truncated": False,
+            "mint": mint,
+            "pool_address": pool_address,
+            "dex_id": str(main_pool.get("dexId") or "unknown"),
+            "price_currency": "usd",
+        }
+        runtime.solana_candle_cache[cache_key] = (monotonic(), result)
+        runtime.solana_candle_cache.move_to_end(cache_key)
+        while len(runtime.solana_candle_cache) > SOLANA_CANDLE_CACHE_MAX_ENTRIES:
+            runtime.solana_candle_cache.popitem(last=False)
+        return _apply_requested_indicators(result, specs)
 
     @v1.get("/solana/tokens/{mint}")
     async def solana_token(mint: str) -> dict[str, Any]:

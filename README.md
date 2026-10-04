@@ -174,11 +174,21 @@ optimistic.
 
 Authenticated `GET /v1/solana/tokens/new?limit=50` lists the latest Solana tokens discovered from
 GeckoTerminal; `limit` is 1–200. `GET /v1/solana/tokens/{mint}` returns an individual token card.
+`GET /v1/solana/search?q=...` searches DEX Screener and returns up to 10 grouped Solana tokens;
+results describe pools found by the search and do not imply endorsement. The token page can use
+`GET /v1/solana/tokens/{mint}/candles?interval=1h&limit=300` for USD GeckoTerminal candles at
+`1m`, `5m`, `15m`, `1h`, `4h`, or `1d` intervals, with the same repeated indicator specs as
+`/v1/candles`.
 The feed refreshes every 60 seconds, keeps at most 200 tokens, and loads cards in the background.
 Cards show sourced, timestamped facts from standard Solana JSON-RPC calls, DEX Screener,
-GeckoTerminal liquidity cross-checks, and the Raydium pool API. RPC is limited to 4 requests/s
-(largest-account requests to 1 per 2 seconds); DEX Screener to 4/s, GeckoTerminal to 1 per 2.5s,
-Raydium to 2/s, and RugCheck to 1/s.
+GeckoTerminal, and the Raydium pool API. `top10_share` uses GeckoTerminal's token-info holder
+distribution by default; it may include pool and exchange accounts, which GeckoTerminal does not
+identify. A custom RPC URL tries account-level holder checks first and falls back to
+GeckoTerminal. Feed card builds skip the optional GeckoTerminal liquidity cross-check; individual
+detail cards retain it. RPC is limited to 4 requests/s (largest-account requests, when a custom RPC
+is used, to 1 per 2 seconds); DEX Screener to 4/s; GeckoTerminal to 1 per 2.5 seconds shared across
+new-pool discovery, holder lookups, detail liquidity cross-checks, and token candles; Raydium to
+2/s; and RugCheck to 1/s.
 Market facts include the selected main pool's price/liquidity/volume plus all-pool count, total
 liquidity, total 24-hour volume, and the time of the full pool read.
 

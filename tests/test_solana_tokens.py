@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import struct
@@ -11,7 +12,7 @@ import pytest
 from solders.pubkey import Pubkey
 
 import baystfirm.solana_tokens as solana_module
-from baystfirm.config import Settings
+from baystfirm.config import DEFAULT_SOLANA_RPC_URL, Settings
 from baystfirm.solana_tokens import (
     METADATA_PROGRAM,
     SPL_TOKEN_PROGRAM,
@@ -43,13 +44,17 @@ RATE_LIMITS_OFF = {
 }
 
 
-def _settings(*, rugcheck_api_key: str | None = None) -> Settings:
+def _settings(
+    *,
+    rugcheck_api_key: str | None = None,
+    solana_rpc_url: str = "https://rpc.example.invalid/?api-key=hidden",
+) -> Settings:
     return Settings(
         database_path=Path("unused.db"),
         enabled_venues=(),
         shadow_mode=True,
         symbols=(),
-        solana_rpc_url="https://rpc.example.invalid/?api-key=hidden",
+        solana_rpc_url=solana_rpc_url,
         rugcheck_api_key=rugcheck_api_key,
         solana_tokens_enabled=False,
     )
@@ -342,6 +347,9 @@ async def test_top10_excludes_pool_owned_accounts_from_concentration() -> None:
 
     assert fact.status == "ok"
     assert fact.value["pct"] == 40.0
+    assert fact.value["pool_accounts_excluded"] is True
+    assert fact.value["holder_count"] is None
+    assert fact.value["as_of"] is None
     assert fact.value["holders"] == [
         {"owner": "pool-address", "pct": 60.0, "is_pool": True},
         {"owner": "wallet-a", "pct": 25.0, "is_pool": False},
@@ -350,7 +358,7 @@ async def test_top10_excludes_pool_owned_accounts_from_concentration() -> None:
 
 
 @pytest.mark.asyncio
-async def test_top10_429_returns_unavailable_fact() -> None:
+async def test_geckoterminal_holder_429_returns_unavailable_fact() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(429)
 
@@ -359,7 +367,115 @@ async def test_top10_429_returns_unavailable_fact() -> None:
         fact = await checker.top10_share(MINT, set())
 
     assert fact.status == "unavailable"
-    assert fact.detail == "Couldn't check right now (Solana connection rate-limited)"
+    assert fact.source == "geckoterminal"
+    assert fact.detail == "Couldn't check right now (rate limited)"
+
+
+@pytest.mark.asyncio
+async def test_default_rpc_uses_geckoterminal_holders_without_largest_accounts() -> None:
+    rpc_methods: list[str] = []
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            rpc_methods.append(json.loads(request.read())["method"])
+            return httpx.Response(500)
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "attributes": {
+                        "holders": {
+                            "count": 1_024_405,
+                            "distribution_percentage": {
+                                "top_10": "38.4623",
+                                "11_20": "8.1",
+                                "21_40": "7.2",
+                                "rest": "46.2",
+                            },
+                            "last_updated": "2026-10-04T21:10:00Z",
+                        }
+                    }
+                }
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        checker = SolanaTokenClient(
+            _settings(solana_rpc_url=DEFAULT_SOLANA_RPC_URL),
+            http,
+            rate_limits=RATE_LIMITS_OFF,
+        )
+        fact = await checker.top10_share(MINT, {"pool-a"})
+
+    assert rpc_methods == []
+    assert requests[0].url.path == f"/api/v2/networks/solana/tokens/{MINT}/info"
+    assert fact.status == "ok"
+    assert fact.source == "geckoterminal"
+    assert fact.fetched_at is not None
+    assert fact.detail == "Top 10 holders per GeckoTerminal; may include pool and exchange accounts"
+    assert fact.value == {
+        "pct": 38.4623,
+        "holder_count": 1_024_405,
+        "as_of": "2026-10-04T21:10:00Z",
+        "pool_accounts_excluded": False,
+        "holders": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_geckoterminal_null_holders_returns_unavailable() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": {"attributes": {"holders": None}}},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        checker = SolanaTokenClient(
+            _settings(solana_rpc_url=DEFAULT_SOLANA_RPC_URL),
+            http,
+            rate_limits=RATE_LIMITS_OFF,
+        )
+        fact = await checker.top10_share(MINT, set())
+
+    assert fact.status == "unavailable"
+    assert fact.source == "geckoterminal"
+    assert fact.detail == "No holder data from GeckoTerminal yet"
+
+
+@pytest.mark.asyncio
+async def test_custom_rpc_429_falls_back_to_geckoterminal() -> None:
+    rpc_methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            rpc_methods.append(json.loads(request.read())["method"])
+            return httpx.Response(429)
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "attributes": {
+                        "holders": {
+                            "count": 65,
+                            "distribution_percentage": {"top_10": "78.9"},
+                            "last_updated": "2026-10-04T21:10:00Z",
+                        }
+                    }
+                }
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        checker = SolanaTokenClient(_settings(), http, rate_limits=RATE_LIMITS_OFF)
+        fact = await checker.top10_share(MINT, set())
+
+    assert rpc_methods == ["getTokenLargestAccounts"]
+    assert fact.status == "ok"
+    assert fact.source == "geckoterminal"
+    assert fact.value["pct"] == 78.9
 
 
 @pytest.mark.asyncio
@@ -377,6 +493,59 @@ async def test_rpc_failure_logs_hostname_without_credential_bearing_url(
     assert "rpc.example.invalid" in caplog.text
     assert "api-key=hidden" not in caplog.text
     assert "https://rpc.example.invalid/" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_feed_card_queues_holder_lookup_without_liquidity_cross_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(404))
+    ) as http:
+        engine = SolanaTokenEngine(
+            SolanaTokenClient(_settings(), http, rate_limits=RATE_LIMITS_OFF)
+        )
+        card = solana_module._pending_card(MINT, "Bonk", "BONK", "2026-10-04T00:00:00+00:00")
+        engine.tokens[MINT] = card
+        calls: list[dict[str, Any]] = []
+
+        async def build_card(
+            mint: str,
+            *,
+            first_seen_at: str,
+            gecko_cross_check: bool,
+            fetch_top10: bool,
+        ) -> Any:
+            calls.append(
+                {
+                    "mint": mint,
+                    "first_seen_at": first_seen_at,
+                    "gecko_cross_check": gecko_cross_check,
+                    "fetch_top10": fetch_top10,
+                }
+            )
+            return card
+
+        monkeypatch.setattr(engine, "build_card", build_card)
+        engine._queue_work("card", MINT)
+        worker = asyncio.create_task(engine.worker())
+        try:
+            await engine._queue.join()
+        finally:
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+
+    assert calls == [
+        {
+            "mint": MINT,
+            "first_seen_at": card.first_seen_at,
+            "gecko_cross_check": False,
+            "fetch_top10": False,
+        }
+    ]
+    engine.schedule_retries()
+    assert ("top10", MINT) in engine._queued
 
 
 @pytest.mark.asyncio
@@ -770,6 +939,7 @@ async def test_holder_retries_are_limited_and_rugcheck_retries_once_after_ten_mi
             }
         )
         engine.tokens[mint] = card.model_copy(update={"facts": facts})
+        engine._top_retry_at[mint] = 0.0
     engine._rug_retry_at[mints[0]] = 1_600.0
     now = 1_000.0
     monkeypatch.setattr(solana_module, "monotonic", lambda: now)
@@ -788,3 +958,58 @@ async def test_holder_retries_are_limited_and_rugcheck_retries_once_after_ten_mi
     engine.schedule_retries()
     assert engine._queue.qsize() == 11
     assert ("rugcheck", mints[0]) not in engine._queued
+
+
+@pytest.mark.asyncio
+async def test_holder_retries_wait_ten_minutes_and_stop_after_six_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 0.0
+    monkeypatch.setattr(solana_module, "monotonic", lambda: now)
+    holder_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        holder_requests.append(request)
+        return httpx.Response(429)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        engine = SolanaTokenEngine(
+            SolanaTokenClient(
+                _settings(solana_rpc_url=DEFAULT_SOLANA_RPC_URL),
+                http,
+                rate_limits=RATE_LIMITS_OFF,
+            )
+        )
+        engine.tokens[MINT] = solana_module._pending_card(
+            MINT,
+            "Bonk",
+            "BONK",
+            "2026-10-04T00:00:00+00:00",
+        )
+        engine._checked_at[MINT] = now
+        worker = asyncio.create_task(engine.worker())
+        try:
+            for attempt in range(1, 7):
+                if attempt > 1:
+                    now += solana_module.TOP_HOLDER_RETRY_SECONDS - 1
+                    engine.schedule_retries()
+                    assert engine._queue.empty()
+                    now += 1
+                engine.schedule_retries()
+                assert engine._queue.qsize() == 1
+                await engine._queue.join()
+                assert engine._top_retry_count[MINT] == attempt
+                if attempt < 6:
+                    assert (
+                        engine._top_retry_at[MINT] == now + solana_module.TOP_HOLDER_RETRY_SECONDS
+                    )
+            engine.schedule_retries()
+            assert engine._queue.empty()
+        finally:
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+
+    assert len(holder_requests) == 6
+    assert all(request.method == "GET" for request in holder_requests)
+    assert engine.tokens[MINT].facts.top10_share.detail == "Couldn't check right now (rate limited)"

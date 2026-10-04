@@ -243,6 +243,39 @@ def test_backtest_endpoint_fetches_closed_candles_and_reports_truncation(
         assert calls == 1
 
 
+def test_backtest_cache_prunes_expired_entries_and_evicts_oldest(
+    tmp_path: Path, monkeypatch
+) -> None:
+    current_time = 1000.0
+    monkeypatch.setattr(service_module, "monotonic", lambda: current_time)
+
+    async def fetcher(*args: object) -> list[Candle]:
+        return []
+
+    monkeypatch.setattr(service_module, "fetch_source_candles", fetcher)
+    app = _strategy_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        runtime = app.state.runtime
+        expired_key = ("coinbase", "EXPIRED-USD", "1m", 100)
+        runtime.backtest_candles[expired_key] = (
+            current_time - service_module.BACKTEST_CACHE_TTL_SECONDS - 1,
+            [],
+        )
+        fresh_keys = [("coinbase", f"TEST-{index}-USD", "1m", 100) for index in range(33)]
+        for index, cache_key in enumerate(fresh_keys):
+            runtime.backtest_candles[cache_key] = (current_time - 50 + index, [])
+
+        response = client.post("/v1/backtest", json=_backtest_body())
+
+        assert response.status_code == 200
+        assert expired_key not in runtime.backtest_candles
+        assert fresh_keys[0] not in runtime.backtest_candles
+        assert fresh_keys[1] not in runtime.backtest_candles
+        assert fresh_keys[2] in runtime.backtest_candles
+        assert ("coinbase", "BTC-USD", "1m", 100) in runtime.backtest_candles
+        assert len(runtime.backtest_candles) == service_module.BACKTEST_CACHE_MAX_ENTRIES
+
+
 def test_backtest_endpoint_maps_upstream_failure_to_502(tmp_path: Path, monkeypatch) -> None:
     async def fetcher(*args: object) -> list[Candle]:
         raise RuntimeError("upstream unavailable")

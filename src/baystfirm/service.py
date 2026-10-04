@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 SEED_VENUE_ORDER = ("coinbase", "kraken", "okx", "binanceus", "bybit")
 SEED_BAR_COUNT = 1500
 BACKTEST_CACHE_TTL_SECONDS = 60.0
+BACKTEST_CACHE_MAX_ENTRIES = 32
 
 
 SourceCandleFetcher = Callable[[httpx.AsyncClient, str, str, str, int], Awaitable[list[Candle]]]
@@ -227,7 +228,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ][-request.bars :]
             except Exception as error:
                 raise HTTPException(status_code=502, detail=str(error)) from error
-            runtime.backtest_candles[cache_key] = (monotonic(), candles)
+            inserted_at = monotonic()
+            for cached_key, (cached_at, _) in list(runtime.backtest_candles.items()):
+                if inserted_at - cached_at >= BACKTEST_CACHE_TTL_SECONDS:
+                    del runtime.backtest_candles[cached_key]
+            runtime.backtest_candles[cache_key] = (inserted_at, candles)
+            while len(runtime.backtest_candles) > BACKTEST_CACHE_MAX_ENTRIES:
+                oldest_key = min(
+                    runtime.backtest_candles,
+                    key=lambda key: runtime.backtest_candles[key][0],
+                )
+                del runtime.backtest_candles[oldest_key]
 
         result = await asyncio.to_thread(backtest, rule, candles, request.fee_bps)
         response = result.model_dump(mode="json")

@@ -36,6 +36,7 @@ BACKTEST_NOTE = (
     "Backtest on historical candles with simulated fees. Past results overstate live results. "
     "Your rule, not investment advice."
 )
+MAX_HOLD_BARS = 500
 
 
 class StrictModel(BaseModel):
@@ -84,6 +85,8 @@ class Condition(StrictModel):
 
 
 class ExitRule(StrictModel):
+    """When after_bars is unset, time-exit at the close after MAX_HOLD_BARS."""
+
     after_bars: int | None = Field(default=None, ge=1, le=500)
     take_profit_pct: float | None = Field(default=None, gt=0, le=100)
     stop_loss_pct: float | None = Field(default=None, gt=0, le=100)
@@ -315,6 +318,7 @@ def _simulate_exit(
         if exit_rule.stop_loss_pct is not None:
             stop_loss_price = entry_price * (1 + exit_rule.stop_loss_pct / 100)
 
+    time_exit_bars = exit_rule.after_bars if exit_rule.after_bars is not None else MAX_HOLD_BARS
     for index in range(entry_index + 1, len(candles)):
         candle = candles[index]
         if rule.expect == "up":
@@ -330,7 +334,7 @@ def _simulate_exit(
         elif profit_hit:
             exit_price = take_profit_price
             exit_reason = "take_profit"
-        elif exit_rule.after_bars is not None and index - entry_index >= exit_rule.after_bars:
+        elif index - entry_index >= time_exit_bars:
             exit_price = candle.close
             exit_reason = "time"
         else:

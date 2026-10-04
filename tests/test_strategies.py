@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from baystfirm.models import Candle
 from baystfirm.strategies import (
     BACKTEST_NOTE,
+    MAX_HOLD_BARS,
     Condition,
     ExitRule,
     IndicatorOperand,
@@ -227,3 +228,27 @@ def test_baseline_enters_every_eligible_bar_without_rule_signals() -> None:
     assert result.stats.trades == 0
     assert result.baseline.trades == 4
     assert result.baseline.win_rate == 0
+
+
+def test_tp_sl_only_rule_time_exits_after_max_hold_bars() -> None:
+    data = [candle(index, 100) for index in range(MAX_HOLD_BARS + 2)]
+
+    result = backtest(
+        rule(exit_data={"take_profit_pct": 5, "stop_loss_pct": 5}),
+        data,
+        fee_bps=0,
+    )
+
+    assert result.trades[0].exit_time == MAX_HOLD_BARS * 60_000
+    assert result.trades[0].exit == 100
+    assert result.trades[0].exit_reason == "time"
+
+
+def test_tp_sl_only_baseline_completes_trades_over_5000_bars() -> None:
+    result = backtest(
+        rule(exit_data={"take_profit_pct": 5, "stop_loss_pct": 5}),
+        [candle(index, 100) for index in range(5000)],
+        fee_bps=0,
+    )
+
+    assert result.baseline.trades == 5000 - MAX_HOLD_BARS

@@ -79,7 +79,9 @@ the returned candles; `null` values at the beginning are expected during warm-up
 ```
 
 `POST /v1/backtest` evaluates a rule against historical closed candles. It is a deterministic,
-intelligence-only simulation and does not execute trades:
+intelligence-only simulation and does not execute trades. If `after_bars` is omitted for a rule
+with a take-profit or stop-loss level, the backtester exits at the close 500 bars after entry when
+neither level has been hit:
 
 ```json
 {

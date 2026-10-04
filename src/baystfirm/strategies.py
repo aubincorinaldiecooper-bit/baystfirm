@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import UTC, datetime
+from math import floor, prod
 from statistics import median
 from typing import Annotated, Literal
 
@@ -33,8 +35,8 @@ Expectation = Literal["up", "down"]
 ExitReason = Literal["take_profit", "stop_loss", "time"]
 
 BACKTEST_NOTE = (
-    "Backtest on historical candles with simulated fees. Past results overstate live results. "
-    "Your rule, not investment advice."
+    "Backtest on historical candles with simulated fees and slippage. Past results overstate "
+    "live results. Your rule, not investment advice."
 )
 MAX_HOLD_BARS = 500
 
@@ -45,7 +47,7 @@ class StrictModel(BaseModel):
 
 class PriceOperand(StrictModel):
     kind: Literal["price"]
-    field: Literal["open", "high", "low", "close"] = "close"
+    field: Literal["open", "high", "low", "close", "volume"] = "close"
 
 
 class IndicatorOperand(StrictModel):
@@ -84,6 +86,11 @@ class Condition(StrictModel):
     right: Operand
 
 
+class ConditionGroup(StrictModel):
+    combine: Literal["all", "any"]
+    conditions: list[Condition] = Field(min_length=2, max_length=5)
+
+
 class ExitRule(StrictModel):
     """When after_bars is unset, time-exit at the close after MAX_HOLD_BARS."""
 
@@ -103,7 +110,7 @@ class Rule(StrictModel):
     venue: str
     symbol: str
     interval: Interval
-    conditions: list[Condition] = Field(min_length=1, max_length=5)
+    conditions: list[Condition | ConditionGroup] = Field(min_length=1, max_length=5)
     combine: Literal["all", "any"] = "all"
     expect: Expectation
     exit: ExitRule
@@ -113,6 +120,8 @@ class BacktestRequest(StrictModel):
     rule: Rule
     bars: int = Field(default=1000, ge=100, le=5000)
     fee_bps: float = Field(default=10, ge=0, le=100)
+    slippage_bps: float = Field(default=5, ge=0, le=100)
+    holdout_pct: float = Field(default=20, ge=0, le=50)
 
 
 class CompletedTrade(StrictModel):
@@ -148,30 +157,95 @@ class BaselineStats(StrictModel):
     avg_return_pct: float | None
 
 
+class Costs(StrictModel):
+    fee_bps: float
+    slippage_bps: float
+    round_trip_pct: float
+
+
+class EquityPoint(StrictModel):
+    time: int
+    equity: float
+
+
+class EquityStats(StrictModel):
+    total_return_pct: float
+    max_drawdown_pct: float
+    curve: list[EquityPoint]
+
+
+class BuyAndHoldStats(StrictModel):
+    """Always long from the first close to the last close, regardless of rule expectation."""
+
+    return_pct: float
+    max_drawdown_pct: float
+
+
+class YearStats(StrictModel):
+    year: int
+    trades: int
+    wins: int
+    win_rate: float | None
+    win_rate_ci95: list[float] | None
+    avg_return_pct: float | None
+    compounded_return_pct: float
+    buy_and_hold_return_pct: float
+
+
+class HoldoutStats(StrictModel):
+    holdout_pct: float
+    split_time: int
+    in_sample: BacktestStats
+    recent: BacktestStats
+
+
 class BacktestResult(StrictModel):
     bars_tested: int
     first_bar_time: int | None
     last_bar_time: int | None
     stats: BacktestStats
     baseline: BaselineStats
+    costs: Costs
+    equity: EquityStats
+    buy_and_hold: BuyAndHoldStats
+    by_year: list[YearStats]
+    holdout: HoldoutStats | None
     trades: list[CompletedTrade]
     open_trades: list[OpenTrade]
     note: str = BACKTEST_NOTE
 
 
-def backtest(rule: Rule, candles: Sequence[Candle], fee_bps: float) -> BacktestResult:
+def backtest(
+    rule: Rule,
+    candles: Sequence[Candle],
+    fee_bps: float,
+    *,
+    slippage_bps: float = 0.0,
+    holdout_pct: float = 0.0,
+) -> BacktestResult:
     """Evaluate a user rule over closed candles; no trade execution is performed."""
     if not 0 <= fee_bps <= 100:
         raise ValueError("fee_bps must be between 0 and 100.")
+    if not 0 <= slippage_bps <= 100:
+        raise ValueError("slippage_bps must be between 0 and 100.")
+    if not 0 <= holdout_pct <= 50:
+        raise ValueError("holdout_pct must be between 0 and 50.")
+
+    per_side_cost_bps = fee_bps + slippage_bps
+    round_trip_pct = 2 * per_side_cost_bps / 100
     indicators = _compute_rule_indicators(rule, candles)
     completed: list[CompletedTrade] = []
     open_trades: list[OpenTrade] = []
+    equity_values = [1.0] * len(candles)
+    equity = 1.0
     index = 0
     while index < len(candles):
         if not _signal_at(rule, candles, indicators, index):
+            equity_values[index] = equity
             index += 1
             continue
-        trade, exit_index = _simulate_exit(rule, candles, index, fee_bps)
+        entry_equity = equity
+        trade, exit_index = _simulate_exit(rule, candles, index, per_side_cost_bps)
         if trade is None or exit_index is None:
             last_candle = candles[-1]
             open_trades.append(
@@ -183,11 +257,71 @@ def backtest(rule: Rule, candles: Sequence[Candle], fee_bps: float) -> BacktestR
                     bars_held=len(candles) - index - 1,
                 )
             )
+            for mark_index in range(index, len(candles)):
+                equity_values[mark_index] = _mark_to_market(
+                    rule.expect,
+                    candles[index].close,
+                    candles[mark_index].close,
+                    entry_equity,
+                    per_side_cost_bps,
+                )
             break
         completed.append(trade)
+        for mark_index in range(index, exit_index):
+            equity_values[mark_index] = _mark_to_market(
+                rule.expect,
+                candles[index].close,
+                candles[mark_index].close,
+                entry_equity,
+                per_side_cost_bps,
+            )
+        equity_values[exit_index] = entry_equity * (1 + trade.return_pct / 100)
+        equity = equity_values[exit_index]
         index = exit_index + 1
 
     returns = [trade.return_pct for trade in completed]
+    baseline_returns = [
+        trade.return_pct
+        for entry_index in range(len(candles))
+        if (trade := _simulate_exit(rule, candles, entry_index, per_side_cost_bps)[0]) is not None
+    ]
+    stats = _stats(returns)
+    baseline_full_stats = _stats(baseline_returns)
+    baseline = BaselineStats(
+        trades=baseline_full_stats.trades,
+        win_rate=baseline_full_stats.win_rate,
+        avg_return_pct=baseline_full_stats.avg_return_pct,
+    )
+    curve = [
+        EquityPoint(time=candle.open_time, equity=value)
+        for candle, value in zip(candles, equity_values, strict=True)
+    ]
+    equity_stats = EquityStats(
+        total_return_pct=(equity_values[-1] - 1) * 100 if equity_values else 0,
+        max_drawdown_pct=_max_drawdown(equity_values),
+        curve=curve,
+    )
+    return BacktestResult(
+        bars_tested=len(candles),
+        first_bar_time=candles[0].open_time if candles else None,
+        last_bar_time=candles[-1].open_time if candles else None,
+        stats=stats,
+        baseline=baseline,
+        costs=Costs(
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            round_trip_pct=round_trip_pct,
+        ),
+        equity=equity_stats,
+        buy_and_hold=_buy_and_hold(candles, round_trip_pct),
+        by_year=_by_year(candles, completed),
+        holdout=_holdout(candles, completed, holdout_pct),
+        trades=completed[-200:],
+        open_trades=open_trades,
+    )
+
+
+def _stats(returns: Sequence[float]) -> BacktestStats:
     wins = sum(value > 0 for value in returns)
     losing_streak = 0
     worst_losing_streak = 0
@@ -197,37 +331,105 @@ def backtest(rule: Rule, candles: Sequence[Candle], fee_bps: float) -> BacktestR
             worst_losing_streak = max(worst_losing_streak, losing_streak)
         else:
             losing_streak = 0
-
-    baseline_returns = [
-        trade.return_pct
-        for entry_index in range(len(candles))
-        if (trade := _simulate_exit(rule, candles, entry_index, fee_bps)[0]) is not None
-    ]
-    baseline_wins = sum(value > 0 for value in baseline_returns)
-    stats = BacktestStats(
-        trades=len(completed),
+    count = len(returns)
+    return BacktestStats(
+        trades=count,
         wins=wins,
-        win_rate=wins / len(completed) if completed else None,
-        win_rate_ci95=_wilson_interval(wins, len(completed)),
-        avg_return_pct=sum(returns) / len(returns) if returns else None,
+        win_rate=wins / count if count else None,
+        win_rate_ci95=_wilson_interval(wins, count),
+        avg_return_pct=sum(returns) / count if count else None,
         median_return_pct=median(returns) if returns else None,
         worst_losing_streak=worst_losing_streak,
     )
-    baseline = BaselineStats(
-        trades=len(baseline_returns),
-        win_rate=baseline_wins / len(baseline_returns) if baseline_returns else None,
-        avg_return_pct=(
-            sum(baseline_returns) / len(baseline_returns) if baseline_returns else None
-        ),
+
+
+def _mark_to_market(
+    expect: Expectation,
+    entry: float,
+    close: float,
+    entry_equity: float,
+    per_side_cost_bps: float,
+) -> float:
+    if close <= 0:
+        raise ValueError("candle close prices must be positive.")
+    directional_pct = (close / entry - 1) * 100 if expect == "up" else (entry / close - 1) * 100
+    return entry_equity * (1 + (directional_pct - per_side_cost_bps / 100) / 100)
+
+
+def _max_drawdown(values: Sequence[float]) -> float:
+    peak = 1.0
+    max_drawdown = 0.0
+    for value in values:
+        peak = max(peak, value)
+        max_drawdown = max(max_drawdown, (1 - value / peak) * 100)
+    return max_drawdown
+
+
+def _buy_and_hold(candles: Sequence[Candle], round_trip_pct: float) -> BuyAndHoldStats:
+    if not candles:
+        return BuyAndHoldStats(return_pct=0, max_drawdown_pct=0)
+    first_close = candles[0].close
+    if first_close <= 0:
+        raise ValueError("candle close prices must be positive.")
+    normalized_closes = []
+    for candle in candles:
+        if candle.close <= 0:
+            raise ValueError("candle close prices must be positive.")
+        normalized_closes.append(candle.close / first_close)
+    return BuyAndHoldStats(
+        return_pct=(normalized_closes[-1] - 1) * 100 - round_trip_pct,
+        max_drawdown_pct=_max_drawdown(normalized_closes),
     )
-    return BacktestResult(
-        bars_tested=len(candles),
-        first_bar_time=candles[0].open_time if candles else None,
-        last_bar_time=candles[-1].open_time if candles else None,
-        stats=stats,
-        baseline=baseline,
-        trades=completed[-200:],
-        open_trades=open_trades,
+
+
+def _by_year(candles: Sequence[Candle], completed: Sequence[CompletedTrade]) -> list[YearStats]:
+    candles_by_year: dict[int, list[Candle]] = {}
+    returns_by_year: dict[int, list[float]] = {}
+    for candle in candles:
+        year = datetime.fromtimestamp(candle.open_time / 1000, UTC).year
+        candles_by_year.setdefault(year, []).append(candle)
+    for trade in completed:
+        year = datetime.fromtimestamp(trade.entry_time / 1000, UTC).year
+        returns_by_year.setdefault(year, []).append(trade.return_pct)
+
+    result: list[YearStats] = []
+    for year, year_candles in sorted(candles_by_year.items()):
+        chronological = sorted(year_candles, key=lambda candle: candle.open_time)
+        first_close = chronological[0].close
+        last_close = chronological[-1].close
+        if first_close <= 0:
+            raise ValueError("candle close prices must be positive.")
+        year_returns = returns_by_year.get(year, [])
+        year_stats = _stats(year_returns)
+        result.append(
+            YearStats(
+                year=year,
+                trades=year_stats.trades,
+                wins=year_stats.wins,
+                win_rate=year_stats.win_rate,
+                win_rate_ci95=year_stats.win_rate_ci95,
+                avg_return_pct=year_stats.avg_return_pct,
+                compounded_return_pct=(prod(1 + value / 100 for value in year_returns) - 1) * 100,
+                buy_and_hold_return_pct=(last_close / first_close - 1) * 100,
+            )
+        )
+    return result
+
+
+def _holdout(
+    candles: Sequence[Candle], completed: Sequence[CompletedTrade], holdout_pct: float
+) -> HoldoutStats | None:
+    if holdout_pct == 0 or not candles:
+        return None
+    split_index = floor(len(candles) * (1 - holdout_pct / 100))
+    split_time = candles[split_index].open_time
+    in_sample = [trade.return_pct for trade in completed if trade.entry_time < split_time]
+    recent = [trade.return_pct for trade in completed if trade.entry_time >= split_time]
+    return HoldoutStats(
+        holdout_pct=holdout_pct,
+        split_time=split_time,
+        in_sample=_stats(in_sample),
+        recent=_stats(recent),
     )
 
 
@@ -235,11 +437,13 @@ def _compute_rule_indicators(
     rule: Rule, candles: Sequence[Candle]
 ) -> dict[str, dict[str, list[float | None]]]:
     specs: dict[str, IndicatorSpec] = {}
-    for condition in rule.conditions:
-        for operand in (condition.left, condition.right):
-            if isinstance(operand, IndicatorOperand):
-                parsed = parse_indicator(operand.spec)
-                specs[parsed.key] = parsed
+    for item in rule.conditions:
+        conditions = item.conditions if isinstance(item, ConditionGroup) else [item]
+        for condition in conditions:
+            for operand in (condition.left, condition.right):
+                if isinstance(operand, IndicatorOperand):
+                    parsed = parse_indicator(operand.spec)
+                    specs[parsed.key] = parsed
     return {key: compute_indicator(spec, candles) for key, spec in specs.items()}
 
 
@@ -249,10 +453,22 @@ def _signal_at(
     indicators: dict[str, dict[str, list[float | None]]],
     index: int,
 ) -> bool:
-    results = [
-        _condition_at(condition, candles, indicators, index) for condition in rule.conditions
-    ]
+    results = [_condition_item_at(item, candles, indicators, index) for item in rule.conditions]
     return all(results) if rule.combine == "all" else any(results)
+
+
+def _condition_item_at(
+    item: Condition | ConditionGroup,
+    candles: Sequence[Candle],
+    indicators: dict[str, dict[str, list[float | None]]],
+    index: int,
+) -> bool:
+    if isinstance(item, Condition):
+        return _condition_at(item, candles, indicators, index)
+    results = [
+        _condition_at(condition, candles, indicators, index) for condition in item.conditions
+    ]
+    return all(results) if item.combine == "all" else any(results)
 
 
 def _condition_at(
@@ -298,7 +514,7 @@ def _simulate_exit(
     rule: Rule,
     candles: Sequence[Candle],
     entry_index: int,
-    fee_bps: float,
+    per_side_cost_bps: float,
 ) -> tuple[CompletedTrade | None, int | None]:
     entry_candle = candles[entry_index]
     entry_price = entry_candle.close
@@ -348,7 +564,7 @@ def _simulate_exit(
             if rule.expect == "up"
             else (entry_price / exit_price - 1) * 100
         )
-        return_pct = directional_return - 2 * fee_bps / 100
+        return_pct = directional_return - 2 * per_side_cost_bps / 100
         return (
             CompletedTrade(
                 entry_time=entry_candle.open_time,

@@ -88,7 +88,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     store = EventStore(resolved.database_path)
     hub = EventHub()
     momentum_classifier = MomentumRegimeClassifier(shadow=resolved.shadow_mode)
-    track_record = TrackRecordService(store)
+    track_record_service = TrackRecordService(store)
     pipeline = IntelligencePipeline(
         store=store,
         hub=hub,
@@ -104,7 +104,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         pipeline=pipeline,
         ingestion=IngestionSupervisor(resolved, pipeline),
         momentum_classifier=momentum_classifier,
-        track_record=track_record,
+        track_record=track_record_service,
     )
 
     @asynccontextmanager
@@ -240,7 +240,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 del runtime.backtest_candles[oldest_key]
 
-        result = await asyncio.to_thread(backtest, rule, candles, request.fee_bps)
+        result = await asyncio.to_thread(
+            backtest,
+            rule,
+            candles,
+            request.fee_bps,
+            slippage_bps=request.slippage_bps,
+            holdout_pct=request.holdout_pct,
+        )
         response = result.model_dump(mode="json")
         response["bars_requested"] = request.bars
         response["truncated"] = len(candles) < request.bars

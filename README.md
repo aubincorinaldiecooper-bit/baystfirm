@@ -71,17 +71,22 @@ validated.
 
 ## Indicators and strategy backtests
 
-Request up to six talipp indicators with repeated `indicator` parameters. Indicator arrays align with
+Request up to six talipp indicators with repeated `indicator` parameters. Supported forms are
+`sma:<period>`, `ema:<period>`, `rsi:<period>`, `macd:<fast>,<slow>,<signal>`,
+`bb:<period>,<mult>`, `atr:<period>`, and `stoch:<period>,<smoothing>`. Periods are 2–200,
+Bollinger multipliers are 0.5–5, and MACD fast must be less than slow. Indicator arrays align with
 the returned candles; `null` values at the beginning are expected during warm-up:
 
 ```text
 /v1/candles?venue=coinbase&symbol=BTC-USD&interval=1h&indicator=sma%3A20&indicator=rsi%3A14
 ```
 
-`POST /v1/backtest` evaluates a rule against historical closed candles. It is a deterministic,
-intelligence-only simulation and does not execute trades. If `after_bars` is omitted for a rule
-with a take-profit or stop-loss level, the backtester exits at the close 500 bars after entry when
-neither level has been hit:
+`POST /v1/backtest` evaluates your rule against historical closed candles. It is a deterministic,
+intelligence-only simulation and does not execute trades. Price operands can use `open`, `high`,
+`low`, `close`, or `volume`. Conditions can be combined at the rule level, or placed in one-level
+`all`/`any` groups of 2–5 conditions. If `after_bars` is omitted for a rule with a take-profit or
+stop-loss level, the backtester exits at the close 500 bars after entry when neither level has
+been hit:
 
 ```json
 {
@@ -92,18 +97,35 @@ neither level has been hit:
     "interval": "1h",
     "conditions": [
       {
-        "left": {"kind": "price", "field": "close"},
-        "op": "above",
-        "right": {"kind": "indicator", "spec": "sma:20"}
+        "combine": "all",
+        "conditions": [
+          {
+            "left": {"kind": "price", "field": "volume"},
+            "op": "above",
+            "right": {"kind": "value", "value": 100}
+          },
+          {
+            "left": {"kind": "price", "field": "close"},
+            "op": "above",
+            "right": {"kind": "indicator", "spec": "bb:20,2", "output": "middle"}
+          }
+        ]
       }
     ],
     "expect": "up",
     "exit": {"after_bars": 24}
   },
   "bars": 1000,
-  "fee_bps": 10
+  "fee_bps": 10,
+  "slippage_bps": 5,
+  "holdout_pct": 20
 }
 ```
+
+The response retains trade statistics, completed/open trade records, and baseline results. It also
+reports the echoed `costs`, an `equity` curve with total return and maximum drawdown, `buy_and_hold`
+return/drawdown (always long, regardless of `expect`), UTC `by_year` statistics, and `holdout`
+in-sample/recent statistics. Set `holdout_pct` to `0` to omit the holdout result.
 
 ## Configuration
 

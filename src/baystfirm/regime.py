@@ -36,6 +36,9 @@ class MomentumRegimeClassifier:
     def has_bars(self, symbol: str) -> bool:
         return self.bars.has_bars(symbol)
 
+    def is_seeded(self, symbol: str) -> bool:
+        return self.bars.is_seeded(symbol)
+
     def seed(self, symbol: str, candles: list[Candle]) -> bool:
         return self.bars.seed(symbol, candles)
 

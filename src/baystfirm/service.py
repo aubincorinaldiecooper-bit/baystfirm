@@ -270,7 +270,7 @@ async def _seed_minute_bars(
         for symbol in settings.symbols:
             if symbol.split("-", maxsplit=1)[0] in STABLECOINS:
                 continue
-            if classifier.has_bars(symbol):
+            if classifier.is_seeded(symbol):
                 continue
             for venue in SEED_VENUE_ORDER:
                 if venue not in enabled_venues or venue not in NATIVE_INTERVALS:

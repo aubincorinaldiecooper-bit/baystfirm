@@ -32,6 +32,7 @@ class _SymbolBars:
     closed: deque[MinuteBar] = field(default_factory=lambda: deque(maxlen=MAX_CLOSED_BARS))
     current: MinuteBar | None = None
     late_trades: int = 0
+    seeded: bool = False
 
 
 class MinuteBarSeries:
@@ -46,43 +47,81 @@ class MinuteBarSeries:
         state = self._symbols.get(symbol)
         return state is not None and (bool(state.closed) or state.current is not None)
 
+    def is_seeded(self, symbol: str) -> bool:
+        state = self._symbols.get(symbol)
+        return state is not None and state.seeded
+
     def closed_bars(self, symbol: str) -> tuple[MinuteBar, ...]:
         state = self._symbols.get(symbol)
         return tuple(state.closed) if state is not None else ()
 
     def seed(self, symbol: str, bars: list[Candle]) -> bool:
         state = self._symbols.setdefault(symbol, _SymbolBars())
-        if state.closed or state.current is not None or not bars:
+        if state.seeded:
             return False
+
+        earliest = (
+            state.closed[0].open_time
+            if state.closed
+            else state.current.open_time
+            if state.current is not None
+            else None
+        )
         previous_open_time: int | None = None
+        seed_bars: list[MinuteBar] = []
         for candle in bars:
             open_time = candle.open_time // 1000
             if previous_open_time is not None and open_time <= previous_open_time:
                 raise ValueError("seed bars must be ordered oldest first")
-            if state.closed:
-                previous = state.closed[-1]
-                gap_minutes = (open_time - previous.open_time) // BAR_SECONDS
+            if earliest is None or open_time < earliest:
+                seed_bars.append(
+                    MinuteBar(
+                        open_time=open_time,
+                        open=candle.open,
+                        high=candle.high,
+                        low=candle.low,
+                        close=candle.close,
+                        trade_count=None,
+                    )
+                )
+            previous_open_time = open_time
+
+        state.seeded = True
+        if not seed_bars:
+            return False
+
+        seeded_closed: deque[MinuteBar] = deque(maxlen=MAX_CLOSED_BARS)
+        for bar in seed_bars:
+            if seeded_closed:
+                previous = seeded_closed[-1]
+                gap_minutes = (bar.open_time - previous.open_time) // BAR_SECONDS
                 if gap_minutes > MAX_GAP_MINUTES:
-                    state.closed.clear()
+                    seeded_closed.clear()
                 else:
                     for offset in range(1, gap_minutes):
-                        state.closed.append(
+                        seeded_closed.append(
                             _flat_bar(
                                 previous.open_time + offset * BAR_SECONDS,
                                 previous.close,
                             )
                         )
-            state.closed.append(
-                MinuteBar(
-                    open_time=open_time,
-                    open=candle.open,
-                    high=candle.high,
-                    low=candle.low,
-                    close=candle.close,
-                    trade_count=None,
+            seeded_closed.append(bar)
+
+        if earliest is not None:
+            latest_seed = seeded_closed[-1]
+            gap_minutes = (earliest - latest_seed.open_time) // BAR_SECONDS
+            if gap_minutes > MAX_GAP_MINUTES:
+                return False
+            for offset in range(1, gap_minutes):
+                seeded_closed.append(
+                    _flat_bar(
+                        latest_seed.open_time + offset * BAR_SECONDS,
+                        latest_seed.close,
+                    )
                 )
-            )
-            previous_open_time = open_time
+
+        seeded_closed.extend(state.closed)
+        state.closed = seeded_closed
         return True
 
     def observe(self, event: MarketEvent) -> list[MinuteBar]:

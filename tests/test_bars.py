@@ -96,3 +96,42 @@ def test_seed_populates_only_an_empty_series() -> None:
         (11, 13, 10, 12),
     ]
     assert all(bar.trade_count is None for bar in bars)
+
+
+def test_seed_prepends_live_history_and_fills_to_the_first_live_bar() -> None:
+    series = MinuteBarSeries()
+    series.observe(trade(100, 10))
+    seed = [
+        Candle(open_time=96 * 60_000, open=8, high=8, low=8, close=8, volume=1),
+        Candle(open_time=98 * 60_000, open=9, high=9, low=9, close=9, volume=1),
+    ]
+
+    assert series.seed("BTC-USD", seed)
+    bars = series.closed_bars("BTC-USD")
+    assert [bar.open_time for bar in bars] == [96 * 60, 97 * 60, 98 * 60, 99 * 60]
+    assert [bar.filled for bar in bars] == [False, True, False, True]
+    assert [bar.close for bar in bars] == [8, 8, 9, 9]
+
+    [closed] = series.observe(trade(101, 11))
+    assert closed.open_time == 100 * 60
+    assert series.closed_bars("BTC-USD")[-1] is closed
+
+
+def test_seed_gap_over_sixty_minutes_rejects_history_and_preserves_live_bars() -> None:
+    series = MinuteBarSeries()
+    series.observe(trade(100, 10))
+    series.observe(trade(101, 11))
+    live_bars = series.closed_bars("BTC-USD")
+    seed = [Candle(open_time=30 * 60_000, open=5, high=5, low=5, close=5, volume=1)]
+
+    assert not series.seed("BTC-USD", seed)
+    assert series.is_seeded("BTC-USD")
+    assert series.closed_bars("BTC-USD") == live_bars
+    assert all(
+        actual is expected
+        for actual, expected in zip(series.closed_bars("BTC-USD"), live_bars, strict=True)
+    )
+    assert not series.seed("BTC-USD", seed)
+
+    [closed] = series.observe(trade(102, 12))
+    assert closed.open_time == 101 * 60

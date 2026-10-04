@@ -136,6 +136,17 @@ def test_sixty_minute_horizon_emits_only_on_epoch_cadence() -> None:
     assert not has_hourly_classification(end_minute + 1)
 
 
+def test_prepended_seed_enables_hourly_horizon_on_next_live_close() -> None:
+    classifier = MomentumRegimeClassifier()
+    classifier.observe(trade(106, 100))
+    classifier.observe(trade(107, 100))
+    assert classifier.seed("BTC-USD", seed_candles(46, [100] * 60))
+
+    results = classifier.observe(trade(108, 100))
+
+    assert any(item.horizon_seconds == 3600 for item in results)
+
+
 def test_majority_filled_horizon_abstains() -> None:
     classifier = MomentumRegimeClassifier()
     start = 100_000
@@ -239,3 +250,53 @@ async def test_seeding_falls_back_in_venue_order_for_perpetuals() -> None:
         ("bybit", "BTC-USDT-PERP", "1m", 1500),
     ]
     assert classifier.has_bars("BTC-USDT-PERP")
+
+
+@pytest.mark.asyncio
+async def test_service_seeding_prepends_after_live_trades() -> None:
+    settings = Settings(
+        database_path=Path("unused.db"),
+        enabled_venues=("coinbase",),
+        shadow_mode=True,
+        symbols=("BTC-USD",),
+    )
+    classifier = MomentumRegimeClassifier()
+    minute_open_ms = int(datetime.now(UTC).timestamp() // 60 * 60_000)
+    current_minute = minute_open_ms // 60_000
+    classifier.observe(trade(current_minute - 1, 10))
+    classifier.observe(trade(current_minute, 11))
+    existing = classifier.bars.closed_bars("BTC-USD")[0]
+    candles = [
+        Candle(
+            open_time=minute_open_ms - 180_000,
+            open=8,
+            high=8,
+            low=8,
+            close=8,
+            volume=1,
+        ),
+        Candle(
+            open_time=minute_open_ms - 120_000,
+            open=9,
+            high=9,
+            low=9,
+            close=9,
+            volume=1,
+        ),
+    ]
+    calls: list[str] = []
+
+    async def fetcher(client, venue: str, symbol: str, interval: str, limit: int):
+        calls.append(venue)
+        return candles
+
+    await _seed_minute_bars(settings, classifier, fetcher=fetcher)
+
+    seeded = classifier.bars.closed_bars("BTC-USD")
+    assert calls == ["coinbase"]
+    assert classifier.is_seeded("BTC-USD")
+    assert [bar.open_time for bar in seeded[:2]] == [
+        minute_open_ms // 1000 - 180,
+        minute_open_ms // 1000 - 120,
+    ]
+    assert seeded[-1] is existing

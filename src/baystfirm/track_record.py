@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -115,12 +116,9 @@ def build_track_record(
 
 
 def _first_at_or_after(times: list[datetime], target: datetime) -> int | None:
-    for index, observed_at in enumerate(times):
-        if observed_at < target:
-            continue
-        if observed_at <= target + timedelta(seconds=OUTCOME_TOLERANCE_SECONDS):
-            return index
-        return None
+    index = bisect_left(times, target)
+    if index < len(times) and times[index] <= target + timedelta(seconds=OUTCOME_TOLERANCE_SECONDS):
+        return index
     return None
 
 

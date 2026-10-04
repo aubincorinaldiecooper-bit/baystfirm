@@ -9,13 +9,15 @@ from baystfirm.models import Classification, EventType, Evidence, MarketEvent
 STABLECOINS = frozenset({"DAI", "FDUSD", "PYUSD", "USDC", "USDE", "USDT"})
 PEG_FRESHNESS = timedelta(seconds=15)
 REFERENCE_FRESHNESS = timedelta(seconds=60)
+MOMENTUM_HISTORY_SECONDS = 35
+MAX_HISTORY_TRADES = 50_000
 
 
 class MarketStateClassifier:
     def __init__(self, *, shadow: bool = True, emit_interval_seconds: float = 1.0) -> None:
         self.shadow = shadow
         self.emit_interval = timedelta(seconds=emit_interval_seconds)
-        self._history: dict[str, deque[MarketEvent]] = defaultdict(lambda: deque(maxlen=500))
+        self._history: dict[str, deque[MarketEvent]] = defaultdict(deque)
         self._stablecoin_observations: dict[str, dict[tuple[str, str], MarketEvent]] = defaultdict(
             dict
         )
@@ -24,7 +26,13 @@ class MarketStateClassifier:
     def observe(self, event: MarketEvent) -> list[Classification]:
         if event.event_type is not EventType.TRADE or event.price is None:
             return []
-        self._history[event.symbol].append(event)
+        history = self._history[event.symbol]
+        history.append(event)
+        cutoff = event.exchange_timestamp - timedelta(seconds=MOMENTUM_HISTORY_SECONDS)
+        while history and history[0].exchange_timestamp < cutoff:
+            history.popleft()
+        while len(history) > MAX_HISTORY_TRADES:
+            history.popleft()
         result: Classification | None = None
         if event.base_asset in STABLECOINS and (
             event.quote_asset == "USD" or event.quote_asset in STABLECOINS
@@ -169,7 +177,7 @@ class MarketStateClassifier:
         source_ids = [window[0].event_id, window[-1].event_id]
         return Classification(
             classifier="short_horizon_momentum",
-            classifier_version="rules-0.2.0",
+            classifier_version="rules-0.2.1",
             symbol=event.symbol,
             label=label,
             probability=probability,

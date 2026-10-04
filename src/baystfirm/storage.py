@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -79,13 +79,10 @@ class EventStore:
         return self._connection
 
     async def append_event(self, event: MarketEvent) -> None:
-        await self.connection.execute(
-            """
-            INSERT OR IGNORE INTO market_events (
-                event_id, venue, symbol, event_type, exchange_timestamp,
-                received_timestamp, payload
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
+        await self.append_events([event])
+
+    async def append_events(self, events: Iterable[MarketEvent]) -> None:
+        values = [
             (
                 str(event.event_id),
                 event.venue,
@@ -94,7 +91,19 @@ class EventStore:
                 event.exchange_timestamp.isoformat(),
                 event.received_timestamp.isoformat(),
                 event.model_dump_json(),
-            ),
+            )
+            for event in events
+        ]
+        if not values:
+            return
+        await self.connection.executemany(
+            """
+            INSERT OR IGNORE INTO market_events (
+                event_id, venue, symbol, event_type, exchange_timestamp,
+                received_timestamp, payload
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
         )
         await self.connection.commit()
 

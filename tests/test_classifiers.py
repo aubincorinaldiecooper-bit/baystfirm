@@ -54,3 +54,34 @@ def test_stablecoin_quoted_pairs_are_converted_to_usd() -> None:
     evidence = {item.metric: item.value for item in result.evidence}
     assert evidence["quote_converted_observations"] == 1
     assert evidence["cross_venue_median_usd_price"] == 0.995
+
+
+def test_momentum_survives_more_than_500_trades_in_30_seconds() -> None:
+    classifier = MarketStateClassifier()
+    start = datetime(2025, 1, 1, tzinfo=UTC)
+    emitted = []
+    trade_count = 1200
+    for index in range(trade_count):
+        seconds = index * 20 / (trade_count - 1)
+        price = 100 * (1 + 0.003 * index / (trade_count - 1))
+        timestamp = start + timedelta(seconds=seconds)
+        event = MarketEvent(
+            venue="test",
+            symbol="BTC-USDT",
+            native_symbol="BTCUSDT",
+            base_asset="BTC",
+            quote_asset="USDT",
+            instrument_kind=InstrumentKind.SPOT,
+            event_type=EventType.TRADE,
+            exchange_timestamp=timestamp,
+            received_timestamp=timestamp,
+            price=price,
+            size=1,
+            payload_hash=payload_digest(str(index)),
+        )
+        emitted.extend(classifier.observe(event))
+
+    momentum = [item for item in emitted if item.classifier == "short_horizon_momentum"]
+    assert momentum
+    assert momentum[-1].classifier_version == "rules-0.2.1"
+    assert momentum[-1].label == "upward_momentum"

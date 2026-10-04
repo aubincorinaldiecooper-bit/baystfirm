@@ -13,7 +13,9 @@ from baystfirm.models import Classification
 NORMAL_LABELS = {
     "stablecoin_peg": "pegged",
     "short_horizon_momentum": "range_bound",
+    "gnsis_chart_momentum": "range_bound",
 }
+OUTCOME_CLASSIFIER = {"gnsis_chart_momentum": "short_horizon_momentum"}
 
 
 @dataclass(frozen=True)
@@ -146,7 +148,8 @@ def label_classifications(
     tolerance = timedelta(seconds=tolerance_seconds)
     records: list[EvaluationRecord] = []
     for prediction in classifications:
-        key = (prediction.classifier, prediction.symbol)
+        outcome_classifier = OUTCOME_CLASSIFIER.get(prediction.classifier, prediction.classifier)
+        key = (outcome_classifier, prediction.symbol)
         target = prediction.observed_at + timedelta(seconds=prediction.horizon_seconds)
         candidates = times.get(key, [])
         index = bisect_left(candidates, target)

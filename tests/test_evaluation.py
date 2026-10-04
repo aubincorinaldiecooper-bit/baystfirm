@@ -61,3 +61,47 @@ def test_labels_come_from_state_one_horizon_later() -> None:
     metrics = evaluate_by_classifier(records)["stablecoin_peg"]
     assert metrics.coverage == 0.5
     assert metrics.accuracy == 0
+
+
+def test_chart_classifier_uses_rules_classifier_as_realized_outcome() -> None:
+    chart = Classification(
+        classifier="gnsis_chart_momentum",
+        classifier_version="shadow-v1",
+        symbol="BTC-USDT",
+        label="upward_momentum",
+        probability=0.72,
+        abstained=False,
+        horizon_seconds=30,
+        observed_at=datetime(2025, 1, 1, tzinfo=UTC),
+        evidence=[],
+        freshness_ms=0,
+    )
+    realized = Classification(
+        classifier="short_horizon_momentum",
+        classifier_version="rules-0.2.1",
+        symbol="BTC-USDT",
+        label="range_bound",
+        probability=0.8,
+        abstained=False,
+        horizon_seconds=30,
+        observed_at=datetime(2025, 1, 1, tzinfo=UTC) + timedelta(seconds=30),
+        evidence=[],
+        freshness_ms=0,
+    )
+    later_chart_prediction = Classification(
+        classifier="gnsis_chart_momentum",
+        classifier_version="shadow-v1",
+        symbol="BTC-USDT",
+        label="downward_momentum",
+        probability=0.81,
+        abstained=False,
+        horizon_seconds=30,
+        observed_at=datetime(2025, 1, 1, tzinfo=UTC) + timedelta(seconds=30),
+        evidence=[],
+        freshness_ms=0,
+    )
+    record = label_classifications([chart, later_chart_prediction, realized])[0]
+    assert record.predicted_label == "upward_momentum"
+    assert record.expected_label == "range_bound"
+    assert record.normal_label == "range_bound"
+    assert record.classifier == "gnsis_chart_momentum"

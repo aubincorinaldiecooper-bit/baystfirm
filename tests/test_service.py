@@ -193,6 +193,9 @@ def test_backtest_endpoint_requires_valid_bounds_and_known_symbols(
         too_much_fee = _backtest_body()
         too_much_fee["fee_bps"] = 101
         assert client.post("/v1/backtest", json=too_much_fee).status_code == 422
+        too_much_slippage = _backtest_body()
+        too_much_slippage["slippage_bps"] = 101
+        assert client.post("/v1/backtest", json=too_much_slippage).status_code == 422
 
         unknown_symbol = client.post(
             "/v1/backtest",
@@ -228,7 +231,10 @@ def test_backtest_endpoint_fetches_closed_candles_and_reports_truncation(
     monkeypatch.setattr(service_module, "fetch_source_candles", fetcher)
     app = _strategy_app(tmp_path, monkeypatch)
     with TestClient(app) as client:
-        response = client.post("/v1/backtest", json=_backtest_body())
+        backtest_body = _backtest_body()
+        backtest_body["slippage_bps"] = 5
+        backtest_body["holdout_pct"] = 25
+        response = client.post("/v1/backtest", json=backtest_body)
         assert response.status_code == 200
         body = response.json()
         assert body["bars_requested"] == 100
@@ -237,8 +243,15 @@ def test_backtest_endpoint_fetches_closed_candles_and_reports_truncation(
         assert body["first_bar_time"] == current_minute - 4 * 60_000
         assert body["last_bar_time"] == current_minute - 60_000
         assert body["stats"]["trades"] == 2
+        assert body["costs"] == {
+            "fee_bps": 10,
+            "slippage_bps": 5,
+            "round_trip_pct": 0.3,
+        }
+        assert set(body) >= {"equity", "buy_and_hold", "by_year", "holdout"}
+        assert body["holdout"]["holdout_pct"] == 25
 
-        second = client.post("/v1/backtest", json=_backtest_body())
+        second = client.post("/v1/backtest", json=backtest_body)
         assert second.status_code == 200
         assert calls == 1
 

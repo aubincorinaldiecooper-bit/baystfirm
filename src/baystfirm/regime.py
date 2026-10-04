@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from math import log, sqrt
 from statistics import pstdev
@@ -52,101 +53,118 @@ class MomentumRegimeClassifier:
         )
         if close_index is None:
             return []
-        closed = all_closed[: close_index + 1]
-        end_seconds = closed_bar.open_time + BAR_SECONDS
-        minute = end_seconds // BAR_SECONDS
-        observed_at = closed_bar_end(closed_bar)
-        results: list[Classification] = []
-        for n in HORIZON_BARS:
-            cadence = max(1, n // 5)
-            if minute % cadence != 0 or len(closed) < n + 1:
-                continue
+        return classify_window(
+            symbol,
+            all_closed[: close_index + 1],
+            shadow=self.shadow,
+            freshness_ms=freshness_ms,
+        )
 
-            horizon_window = closed[-(n + 1) :]
-            sigma_return_count = min(max(n, 60), len(closed) - 1)
-            if sigma_return_count < n:
-                continue
-            sigma_window = closed[-(sigma_return_count + 1) :]
-            if any(bar.close <= 0 for bar in sigma_window):
-                continue
-            returns = [
-                log(newer.close / older.close)
-                for older, newer in zip(sigma_window, sigma_window[1:], strict=False)
-            ]
-            if not returns:
-                continue
 
-            oldest_close = horizon_window[0].close
-            newest_close = horizon_window[-1].close
-            if oldest_close <= 0 or newest_close <= 0:
-                continue
-            lookback_return = log(newest_close / oldest_close)
-            sigma1 = pstdev(returns)
-            threshold = max(sigma1 * sqrt(n), 5e-4)
-            filled_share = sum(bar.filled for bar in horizon_window[-n:]) / n
-            score = abs(lookback_return) / threshold
+def classify_window(
+    symbol: str,
+    closed: Sequence[MinuteBar],
+    *,
+    shadow: bool,
+    freshness_ms: float,
+) -> list[Classification]:
+    if not closed:
+        return []
+    closed_bar = closed[-1]
+    end_seconds = closed_bar.open_time + BAR_SECONDS
+    minute = end_seconds // BAR_SECONDS
+    observed_at = closed_bar_end(closed_bar)
+    results: list[Classification] = []
+    for n in HORIZON_BARS:
+        cadence = max(1, n // 5)
+        if minute % cadence != 0 or len(closed) < n + 1:
+            continue
 
-            abstained = filled_share > 0.5
-            if abstained:
-                label = "range_bound"
-                probability = 0.5
-            elif lookback_return >= threshold:
-                label = "upward_momentum"
-                probability = min(0.9, 0.5 + 0.2 * min(score, 2))
-            elif lookback_return <= -threshold:
-                label = "downward_momentum"
-                probability = min(0.9, 0.5 + 0.2 * min(score, 2))
-            else:
-                label = "range_bound"
-                probability = 0.5 + 0.4 * (1 - score)
+        horizon_window = closed[-(n + 1) :]
+        sigma_return_count = min(max(n, 60), len(closed) - 1)
+        if sigma_return_count < n:
+            continue
+        sigma_window = closed[-(sigma_return_count + 1) :]
+        if any(bar.close <= 0 for bar in sigma_window):
+            continue
+        returns = [
+            log(newer.close / older.close)
+            for older, newer in zip(sigma_window, sigma_window[1:], strict=False)
+        ]
+        if not returns:
+            continue
 
-            source_event_ids = _source_event_ids(horizon_window[0], horizon_window[-1])
-            evidence = [
-                Evidence(
-                    metric="lookback_return_bps",
-                    value=lookback_return * 10_000,
-                    threshold=threshold * 10_000,
-                    source_event_ids=source_event_ids,
-                ),
-                Evidence(
-                    metric="threshold_bps",
-                    value=threshold * 10_000,
-                    source_event_ids=source_event_ids,
-                ),
-                Evidence(
-                    metric="realized_vol_1m_bps",
-                    value=sigma1 * 10_000,
-                    source_event_ids=source_event_ids,
-                ),
-                Evidence(
-                    metric="bars_used",
-                    value=n,
-                    threshold=n,
-                    source_event_ids=source_event_ids,
-                ),
-                Evidence(
-                    metric="filled_bar_share",
-                    value=filled_share,
-                    threshold=0.5,
-                    source_event_ids=source_event_ids,
-                ),
-            ]
-            results.append(
-                Classification(
-                    classifier="momentum_regime",
-                    classifier_version=CLASSIFIER_VERSION,
-                    symbol=symbol,
-                    label=label,
-                    probability=probability,
-                    abstained=abstained,
-                    horizon_seconds=n * BAR_SECONDS,
-                    observed_at=observed_at,
-                    evidence=evidence,
-                    shadow=self.shadow,
-                    freshness_ms=freshness_ms,
-                )
+        oldest_close = horizon_window[0].close
+        newest_close = horizon_window[-1].close
+        if oldest_close <= 0 or newest_close <= 0:
+            continue
+        lookback_return = log(newest_close / oldest_close)
+        sigma1 = pstdev(returns)
+        threshold = max(sigma1 * sqrt(n), 5e-4)
+        filled_share = sum(bar.filled for bar in horizon_window[-n:]) / n
+        score = abs(lookback_return) / threshold
+
+        abstained = filled_share > 0.5
+        if abstained:
+            label = "range_bound"
+            probability = 0.5
+        elif lookback_return >= threshold:
+            label = "upward_momentum"
+            probability = min(0.9, 0.5 + 0.2 * min(score, 2))
+        elif lookback_return <= -threshold:
+            label = "downward_momentum"
+            probability = min(0.9, 0.5 + 0.2 * min(score, 2))
+        else:
+            label = "range_bound"
+            probability = 0.5 + 0.4 * (1 - score)
+
+        source_event_ids = _source_event_ids(horizon_window[0], horizon_window[-1])
+        evidence = [
+            Evidence(
+                metric="lookback_return_bps",
+                value=lookback_return * 10_000,
+                threshold=threshold * 10_000,
+                source_event_ids=source_event_ids,
+            ),
+            Evidence(
+                metric="threshold_bps",
+                value=threshold * 10_000,
+                source_event_ids=source_event_ids,
+            ),
+            Evidence(
+                metric="realized_vol_1m_bps",
+                value=sigma1 * 10_000,
+                source_event_ids=source_event_ids,
+            ),
+            Evidence(
+                metric="bars_used",
+                value=n,
+                threshold=n,
+                source_event_ids=source_event_ids,
+            ),
+            Evidence(
+                metric="filled_bar_share",
+                value=filled_share,
+                threshold=0.5,
+                source_event_ids=source_event_ids,
+            ),
+        ]
+        results.append(
+            Classification(
+                classifier="momentum_regime",
+                classifier_version=CLASSIFIER_VERSION,
+                symbol=symbol,
+                label=label,
+                probability=probability,
+                abstained=abstained,
+                horizon_seconds=n * BAR_SECONDS,
+                observed_at=observed_at,
+                evidence=evidence,
+                shadow=shadow,
+                freshness_ms=freshness_ms,
             )
-        return results
+        )
+    return results
 
 
 def closed_bar_end(bar: MinuteBar) -> datetime:

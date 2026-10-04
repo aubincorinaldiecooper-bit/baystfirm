@@ -47,6 +47,7 @@ def test_api_key_guards_v1_routes(tmp_path: Path) -> None:
         assert client.get("/health").status_code == 200
         assert client.get("/v1/snapshot").status_code == 401
         assert client.get("/v1/track-record").status_code == 401
+        assert client.get("/v1/track-record/backtest").status_code == 401
         assert client.post("/v1/backtest", json=_backtest_body()).status_code == 401
         batch_body = _backtest_body()
         batch_body["also"] = [{"venue": "coinbase", "symbol": "ETH-USD"}]
@@ -61,6 +62,13 @@ def test_api_key_guards_v1_routes(tmp_path: Path) -> None:
         )
         assert track_record.status_code == 200
         assert track_record.json()["window_hours"] == 24
+        assert (
+            client.get(
+                "/v1/track-record/backtest",
+                headers={"Authorization": "Bearer secret"},
+            ).status_code
+            == 200
+        )
 
 
 def test_track_record_window_hours_validation(tmp_path: Path) -> None:
@@ -99,6 +107,7 @@ async def _no_background_work(*args: object, **kwargs: object) -> None:
 def _strategy_app(tmp_path: Path, monkeypatch) -> object:
     app = create_app(_strategy_settings(tmp_path))
     monkeypatch.setattr(service_module, "_seed_minute_bars", _no_background_work)
+    monkeypatch.setattr(service_module, "_signal_backtest_loop", _no_background_work)
     monkeypatch.setattr(app.state.runtime.ingestion, "start", _no_background_work)
     monkeypatch.setattr(app.state.runtime.ingestion, "stop", _no_background_work)
     return app
@@ -114,9 +123,50 @@ def _batch_strategy_app(tmp_path: Path, monkeypatch) -> object:
         )
     )
     monkeypatch.setattr(service_module, "_seed_minute_bars", _no_background_work)
+    monkeypatch.setattr(service_module, "_signal_backtest_loop", _no_background_work)
     monkeypatch.setattr(app.state.runtime.ingestion, "start", _no_background_work)
     monkeypatch.setattr(app.state.runtime.ingestion, "stop", _no_background_work)
     return app
+
+
+def _signal_backtest_app(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    symbols: tuple[str, ...],
+    enabled_venues: tuple[str, ...] = ("coinbase",),
+) -> object:
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "signal-backtest.db",
+            enabled_venues=enabled_venues,
+            shadow_mode=True,
+            symbols=symbols,
+        )
+    )
+    monkeypatch.setattr(service_module, "_seed_minute_bars", _no_background_work)
+    monkeypatch.setattr(service_module, "_signal_backtest_loop", _no_background_work)
+    monkeypatch.setattr(app.state.runtime.ingestion, "start", _no_background_work)
+    monkeypatch.setattr(app.state.runtime.ingestion, "stop", _no_background_work)
+    return app
+
+
+def _signal_candles() -> list[Candle]:
+    current_minute = (int(datetime.now(UTC).timestamp() * 1000) // 60_000) * 60_000
+    start_ms = current_minute - 360 * 60_000
+    rising = [100 * 1.001**index for index in range(120)]
+    closes = rising + [rising[-1]] * 240
+    return [
+        Candle(
+            open_time=start_ms + index * 60_000,
+            open=close,
+            high=close,
+            low=close,
+            close=close,
+            volume=1,
+        )
+        for index, close in enumerate(closes)
+    ]
 
 
 def _backtest_body(*, symbol: str = "BTC-USD", bars: int = 100) -> dict[str, object]:
@@ -418,6 +468,124 @@ def test_batch_backtest_keeps_candle_fetch_failures_per_instrument(
     assert response.json()["results"][1]["error"] == "upstream unavailable"
     assert response.json()["results"][1]["stats"] is None
     assert response.json()["summary"]["instruments_failed"] == 1
+
+
+def test_track_record_backtest_returns_computing_before_first_result(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = _signal_backtest_app(tmp_path, monkeypatch, symbols=("BTC-USD",))
+
+    with TestClient(app) as client:
+        response = client.get("/v1/track-record/backtest")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "computing",
+        "computed_at": None,
+        "span_start": None,
+        "span_end": None,
+        "sources": [],
+        "groups": [],
+        "note": service_module.BACKTEST_NOTE,
+    }
+
+
+def test_track_record_backtest_pools_ready_results_and_sources(tmp_path: Path, monkeypatch) -> None:
+    candles = _signal_candles()
+    calls: list[tuple[str, str, int]] = []
+
+    async def fetcher(
+        _client: object,
+        venue: str,
+        symbol: str,
+        _interval: str,
+        limit: int,
+    ) -> list[Candle]:
+        calls.append((venue, symbol, limit))
+        return candles
+
+    app = _signal_backtest_app(
+        tmp_path,
+        monkeypatch,
+        symbols=("BTC-USD", "ETH-USD", "USDC-USD"),
+    )
+    with TestClient(app) as client:
+        runtime = app.state.runtime
+
+        async def compute() -> dict[str, object]:
+            return await service_module._compute_signal_backtest(runtime, fetcher=fetcher)
+
+        runtime.signal_backtest = client.portal.call(compute)
+        response = client.get("/v1/track-record/backtest")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["computed_at"] is not None
+    assert (
+        body["span_start"] == datetime.fromtimestamp(candles[0].open_time / 1000, UTC).isoformat()
+    )
+    assert (
+        body["span_end"]
+        == datetime.fromtimestamp(
+            (candles[-1].open_time + 60_000) / 1000,
+            UTC,
+        ).isoformat()
+    )
+    assert body["sources"] == [
+        {"symbol": "BTC-USD", "venue": "coinbase", "bars": 360},
+        {"symbol": "ETH-USD", "venue": "coinbase", "bars": 360},
+    ]
+    assert calls == [
+        ("coinbase", "BTC-USD", service_module.BACKTEST_BAR_COUNT),
+        ("coinbase", "ETH-USD", service_module.BACKTEST_BAR_COUNT),
+    ]
+    groups = {group["horizon_seconds"]: group for group in body["groups"]}
+    assert set(groups) >= {60, 300}
+    assert all(group["classifier"] == "momentum_regime" for group in body["groups"])
+    assert groups[60]["scored"] == 714
+    assert groups[60]["hits"] == 712
+    assert groups[60]["pending"] == 4
+    assert body["note"] == service_module.BACKTEST_NOTE
+
+
+def test_track_record_backtest_falls_through_to_next_eligible_venue(
+    tmp_path: Path, monkeypatch
+) -> None:
+    candles = _signal_candles()
+    calls: list[str] = []
+
+    async def fetcher(
+        _client: object,
+        venue: str,
+        _symbol: str,
+        _interval: str,
+        _limit: int,
+    ) -> list[Candle]:
+        calls.append(venue)
+        if venue == "coinbase":
+            raise RuntimeError("coinbase unavailable")
+        return candles
+
+    app = _signal_backtest_app(
+        tmp_path,
+        monkeypatch,
+        symbols=("BTC-USD",),
+        enabled_venues=("coinbase", "okx"),
+    )
+    with TestClient(app) as client:
+
+        async def compute() -> dict[str, object]:
+            return await service_module._compute_signal_backtest(
+                app.state.runtime,
+                fetcher=fetcher,
+            )
+
+        result = client.portal.call(compute)
+
+    assert calls == ["coinbase", "okx"]
+    assert result["status"] == "ready"
+    assert result["sources"] == [{"symbol": "BTC-USD", "venue": "okx", "bars": 360}]
 
 
 def test_backtest_endpoint_maps_upstream_failure_to_502(tmp_path: Path, monkeypatch) -> None:

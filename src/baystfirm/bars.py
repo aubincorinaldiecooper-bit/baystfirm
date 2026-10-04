@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import UUID
@@ -68,44 +69,21 @@ class MinuteBarSeries:
             else None
         )
         previous_open_time: int | None = None
-        seed_bars: list[MinuteBar] = []
+        seed_candles: list[Candle] = []
         for candle in bars:
             open_time = candle.open_time // 1000
             if previous_open_time is not None and open_time <= previous_open_time:
                 raise ValueError("seed bars must be ordered oldest first")
             if earliest is None or open_time < earliest:
-                seed_bars.append(
-                    MinuteBar(
-                        open_time=open_time,
-                        open=candle.open,
-                        high=candle.high,
-                        low=candle.low,
-                        close=candle.close,
-                        trade_count=None,
-                    )
-                )
+                seed_candles.append(candle)
             previous_open_time = open_time
 
         state.seeded = True
+        seed_bars = fill_minute_bars(seed_candles)
         if not seed_bars:
             return False
 
-        seeded_closed: deque[MinuteBar] = deque(maxlen=MAX_CLOSED_BARS)
-        for bar in seed_bars:
-            if seeded_closed:
-                previous = seeded_closed[-1]
-                gap_minutes = (bar.open_time - previous.open_time) // BAR_SECONDS
-                if gap_minutes > MAX_GAP_MINUTES:
-                    seeded_closed.clear()
-                else:
-                    for offset in range(1, gap_minutes):
-                        seeded_closed.append(
-                            _flat_bar(
-                                previous.open_time + offset * BAR_SECONDS,
-                                previous.close,
-                            )
-                        )
-            seeded_closed.append(bar)
+        seeded_closed: deque[MinuteBar] = deque(seed_bars, maxlen=MAX_CLOSED_BARS)
 
         if earliest is not None:
             latest_seed = seeded_closed[-1]
@@ -217,3 +195,37 @@ def _flat_bar(open_time: int, price: float) -> MinuteBar:
         trade_count=0,
         filled=True,
     )
+
+
+def fill_minute_bars(candles: Sequence[Candle]) -> list[MinuteBar]:
+    bars: list[MinuteBar] = []
+    previous_open_time: int | None = None
+    for candle in candles:
+        open_time = candle.open_time // 1000
+        if previous_open_time is not None and open_time <= previous_open_time:
+            raise ValueError("seed bars must be ordered oldest first")
+        if bars:
+            previous = bars[-1]
+            gap_minutes = (open_time - previous.open_time) // BAR_SECONDS
+            if gap_minutes > MAX_GAP_MINUTES:
+                bars.clear()
+            else:
+                for offset in range(1, gap_minutes):
+                    bars.append(
+                        _flat_bar(
+                            previous.open_time + offset * BAR_SECONDS,
+                            previous.close,
+                        )
+                    )
+        bars.append(
+            MinuteBar(
+                open_time=open_time,
+                open=candle.open,
+                high=candle.high,
+                low=candle.low,
+                close=candle.close,
+                trade_count=None,
+            )
+        )
+        previous_open_time = open_time
+    return bars

@@ -161,6 +161,15 @@ Coins can move together, so instruments are not independent tests; judge how bro
 holds up rather than selecting the best result. An invalid or unavailable instrument is reported
 as an error for that result while the rest of the batch continues.
 
+## Momentum regime replay track record
+
+Authenticated `GET /v1/track-record/backtest` replays the `momentum_regime` classifier on the last
+seven days of closed 1-minute candles, using one eligible exchange per configured instrument. It
+initially returns `computing`, then reports pooled horizon groups and each source; the background
+replay refreshes every six hours. Live classifications use trades merged from all venues, and
+overlapping predictions are scored individually, so replay results can differ and intervals are
+optimistic.
+
 ## Configuration
 
 | Variable | Default | Purpose |

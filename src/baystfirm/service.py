@@ -25,6 +25,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 
+from baystfirm.bars import fill_minute_bars
 from baystfirm.candles import (
     INTERVAL_SECONDS,
     NATIVE_INTERVALS,
@@ -46,8 +47,9 @@ from baystfirm.ingestion import IngestionSupervisor
 from baystfirm.models import Candle
 from baystfirm.pipeline import IntelligencePipeline
 from baystfirm.regime import MomentumRegimeClassifier
+from baystfirm.signal_backtest import replay_momentum
 from baystfirm.sse import sse_frames
-from baystfirm.storage import EventStore
+from baystfirm.storage import ClassificationRow, EventStore
 from baystfirm.strategies import (
     BATCH_NOTE,
     BacktestRequest,
@@ -57,11 +59,19 @@ from baystfirm.strategies import (
     backtest,
     summarize_batch,
 )
-from baystfirm.track_record import TrackRecordService
+from baystfirm.track_record import TrackRecordService, score_track_record
 
 logger = logging.getLogger(__name__)
 SEED_VENUE_ORDER = ("coinbase", "kraken", "okx", "binanceus", "bybit")
 SEED_BAR_COUNT = 1500
+BACKTEST_BAR_COUNT = 10_080
+SIGNAL_BACKTEST_REFRESH_SECONDS = 6 * 60 * 60
+BACKTEST_NOTE = (
+    "Replayed on 1-minute candles from one exchange per instrument; live calls use trades merged "
+    "from all venues, so results can differ. Backtests usually look better than live results. "
+    "Overlapping predictions are scored individually, so intervals are optimistic. Probabilities, "
+    "not investment advice."
+)
 BACKTEST_CACHE_TTL_SECONDS = 60.0
 BACKTEST_CACHE_MAX_ENTRIES = 32
 
@@ -82,6 +92,8 @@ class Runtime:
         default_factory=dict
     )
     seed_task: asyncio.Task[None] | None = None
+    signal_backtest: dict[str, Any] | None = None
+    signal_backtest_task: asyncio.Task[None] | None = None
 
 
 def _authorized(expected: str | None, authorization: str | None) -> bool:
@@ -122,15 +134,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             _seed_minute_bars(runtime.settings, runtime.momentum_classifier),
             name="seed-momentum-minute-bars",
         )
+        runtime.signal_backtest_task = asyncio.create_task(
+            _signal_backtest_loop(runtime),
+            name="momentum-signal-backtest",
+        )
         try:
             await runtime.ingestion.start()
             yield
         finally:
             await runtime.ingestion.stop()
-            if runtime.seed_task is not None:
-                runtime.seed_task.cancel()
+            for task in (runtime.seed_task, runtime.signal_backtest_task):
+                if task is None:
+                    continue
+                task.cancel()
                 try:
-                    await runtime.seed_task
+                    await task
                 except asyncio.CancelledError:
                     pass
             await runtime.store.close()
@@ -448,6 +466,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def track_record(window_hours: int = Query(default=24, ge=1, le=168)) -> dict[str, Any]:
         return await runtime.track_record.get(window_hours)
 
+    @v1.get("/track-record/backtest")
+    async def track_record_backtest() -> dict[str, Any]:
+        if runtime.signal_backtest is not None:
+            return runtime.signal_backtest
+        return {
+            "status": "computing",
+            "computed_at": None,
+            "span_start": None,
+            "span_end": None,
+            "sources": [],
+            "groups": [],
+            "note": BACKTEST_NOTE,
+        }
+
     @v1.get("/snapshot")
     async def snapshot() -> dict[str, object]:
         events = sorted(
@@ -539,6 +571,107 @@ async def _seed_minute_bars(
                         venue,
                         exc_info=True,
                     )
+
+
+async def _signal_backtest_loop(
+    runtime: Runtime,
+    *,
+    fetcher: SourceCandleFetcher | None = None,
+) -> None:
+    while True:
+        try:
+            runtime.signal_backtest = await _compute_signal_backtest(runtime, fetcher=fetcher)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("momentum signal backtest computation failed")
+        await asyncio.sleep(SIGNAL_BACKTEST_REFRESH_SECONDS)
+
+
+async def _compute_signal_backtest(
+    runtime: Runtime,
+    *,
+    fetcher: SourceCandleFetcher | None = None,
+) -> dict[str, Any]:
+    fetcher = fetch_source_candles if fetcher is None else fetcher
+    enabled_venues = set(runtime.settings.enabled_venues)
+    sources: list[dict[str, str | int]] = []
+    rows: list[ClassificationRow] = []
+    span_starts: list[datetime] = []
+    span_ends: list[datetime] = []
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for symbol in runtime.settings.symbols:
+            if symbol.split("-", maxsplit=1)[0] in STABLECOINS:
+                continue
+            found_source = False
+            for venue in SEED_VENUE_ORDER:
+                if venue not in enabled_venues or venue not in NATIVE_INTERVALS:
+                    continue
+                if symbol.endswith("-PERP") and venue not in PERPETUAL_VENUES:
+                    continue
+                try:
+                    fetched = await fetcher(
+                        client,
+                        venue,
+                        symbol,
+                        "1m",
+                        BACKTEST_BAR_COUNT,
+                    )
+                    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+                    closed = sorted(
+                        {
+                            candle.open_time: candle
+                            for candle in fetched
+                            if candle.open_time + 60_000 <= now_ms
+                        }.values(),
+                        key=lambda candle: candle.open_time,
+                    )[-BACKTEST_BAR_COUNT:]
+                    if not closed:
+                        raise ValueError("candle source returned no closed 1m bars")
+
+                    filled = fill_minute_bars(closed)
+                    rows.extend(await asyncio.to_thread(replay_momentum, symbol, closed))
+                    sources.append({"symbol": symbol, "venue": venue, "bars": len(closed)})
+                    span_starts.append(datetime.fromtimestamp(filled[0].open_time, UTC))
+                    span_ends.append(datetime.fromtimestamp(filled[-1].open_time + 60, UTC))
+                    logger.info(
+                        "replayed momentum backtest for %s with %d closed bars from %s",
+                        symbol,
+                        len(closed),
+                        venue,
+                    )
+                    found_source = True
+                    break
+                except Exception:
+                    logger.warning(
+                        "could not replay momentum backtest for %s from %s",
+                        symbol,
+                        venue,
+                        exc_info=True,
+                    )
+            if not found_source:
+                logger.warning("skipping momentum backtest for %s after venue failures", symbol)
+
+    if span_starts:
+        span_start = min(span_starts)
+        span_end = max(span_ends)
+        groups = score_track_record(rows, span_start, span_end)
+        groups = [group for group in groups if group["classifier"] == "momentum_regime"]
+    else:
+        span_start = None
+        span_end = None
+        groups = []
+
+    return {
+        "status": "ready",
+        "computed_at": datetime.now(UTC).isoformat(),
+        "span_start": span_start.isoformat() if span_start is not None else None,
+        "span_end": span_end.isoformat() if span_end is not None else None,
+        "sources": sources,
+        "groups": groups,
+        "note": BACKTEST_NOTE,
+    }
 
 
 app = create_app()

@@ -5,9 +5,10 @@ from statistics import pstdev
 
 import pytest
 
+from baystfirm.bars import MAX_CLOSED_BARS, fill_minute_bars
 from baystfirm.config import Settings
 from baystfirm.models import Candle, EventType, InstrumentKind, MarketEvent, payload_digest
-from baystfirm.regime import MomentumRegimeClassifier
+from baystfirm.regime import MomentumRegimeClassifier, classify_window
 from baystfirm.service import _seed_minute_bars
 
 
@@ -42,6 +43,47 @@ def seed_candles(start_minute: int, prices: list[float]) -> list[Candle]:
         )
         for index, price in enumerate(prices)
     ]
+
+
+def test_fill_minute_bars_fills_short_gaps_and_drops_older_long_gaps() -> None:
+    candles = seed_candles(0, [10, 11])
+    candles.extend(seed_candles(5, [12]))
+    candles.extend(seed_candles(66, [20, 21, 22]))
+
+    filled = fill_minute_bars(candles[:3])
+    assert [bar.open_time for bar in filled] == [0, 60, 120, 180, 240, 300]
+    assert [bar.filled for bar in filled] == [False, False, True, True, True, False]
+
+    bars = fill_minute_bars(candles)
+
+    assert [bar.open_time for bar in bars] == [66 * 60, 67 * 60, 68 * 60]
+
+
+def test_classify_window_matches_live_closed_bar_classification() -> None:
+    candles = seed_candles(100_000, [100 + index / 10 for index in range(350)])
+    classifier = MomentumRegimeClassifier(shadow=False)
+    assert classifier.seed("BTC-USD", candles)
+    closed = classifier.bars.closed_bars("BTC-USD")
+
+    live = [
+        item
+        for index, bar in enumerate(closed)
+        for item in classifier._classify_closed_bar("BTC-USD", bar, 0.0)
+    ]
+    replay = [
+        item
+        for index in range(len(closed))
+        for item in classify_window(
+            "BTC-USD",
+            closed[max(0, index - (MAX_CLOSED_BARS - 1)) : index + 1],
+            shadow=False,
+            freshness_ms=0.0,
+        )
+    ]
+
+    assert [
+        (item.label, item.probability, item.horizon_seconds, item.observed_at) for item in live
+    ] == [(item.label, item.probability, item.horizon_seconds, item.observed_at) for item in replay]
 
 
 def classify_next_bar(

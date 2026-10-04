@@ -32,7 +32,24 @@ def build_track_record(
         raise ValueError("window_hours must be between 1 and 168")
     now = now.astimezone(UTC)
     window_start = now - timedelta(hours=window_hours)
-    latest_matured_at = now - timedelta(seconds=OUTCOME_TOLERANCE_SECONDS)
+    result_groups = score_track_record(rows, window_start, now)
+    return {
+        "computed_at": now.isoformat(),
+        "window_hours": window_hours,
+        "window_start": window_start.isoformat(),
+        "groups": result_groups,
+        "note": NOTE,
+    }
+
+
+def score_track_record(
+    rows: Sequence[ClassificationRow],
+    window_start: datetime,
+    window_end: datetime,
+) -> list[dict[str, Any]]:
+    window_start = window_start.astimezone(UTC)
+    window_end = window_end.astimezone(UTC)
+    latest_matured_at = window_end - timedelta(seconds=OUTCOME_TOLERANCE_SECONDS)
     groups: dict[tuple[str, int], list[ClassificationRow]] = defaultdict(list)
     outcomes: dict[tuple[str, str, int], list[ClassificationRow]] = defaultdict(list)
 
@@ -106,13 +123,7 @@ def build_track_record(
             }
         )
 
-    return {
-        "computed_at": now.isoformat(),
-        "window_hours": window_hours,
-        "window_start": window_start.isoformat(),
-        "groups": result_groups,
-        "note": NOTE,
-    }
+    return result_groups
 
 
 def _first_at_or_after(times: list[datetime], target: datetime) -> int | None:

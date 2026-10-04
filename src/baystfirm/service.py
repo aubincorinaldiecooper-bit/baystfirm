@@ -48,6 +48,13 @@ from baystfirm.models import Candle
 from baystfirm.pipeline import IntelligencePipeline
 from baystfirm.regime import MomentumRegimeClassifier
 from baystfirm.signal_backtest import replay_momentum
+from baystfirm.solana_tokens import (
+    SOURCE_NAMES,
+    NotTokenMint,
+    SolanaTokenClient,
+    SolanaTokenEngine,
+    validate_mint,
+)
 from baystfirm.sse import sse_frames
 from baystfirm.storage import ClassificationRow, EventStore
 from baystfirm.strategies import (
@@ -74,6 +81,13 @@ BACKTEST_NOTE = (
 )
 BACKTEST_CACHE_TTL_SECONDS = 60.0
 BACKTEST_CACHE_MAX_ENTRIES = 32
+SOLANA_TOKEN_REFRESH_SECONDS = 60
+SOLANA_TOKEN_WORKERS = 4
+SOLANA_TOKENS_NOTE = (
+    "Facts read from public sources at the times shown. Our own checks come first; RugCheck is "
+    "shown as a second opinion. There is no overall safety verdict. Probabilities and facts, "
+    "not investment advice."
+)
 
 
 SourceCandleFetcher = Callable[[httpx.AsyncClient, str, str, str, int], Awaitable[list[Candle]]]
@@ -94,6 +108,9 @@ class Runtime:
     seed_task: asyncio.Task[None] | None = None
     signal_backtest: dict[str, Any] | None = None
     signal_backtest_task: asyncio.Task[None] | None = None
+    solana_tokens: SolanaTokenEngine | None = None
+    solana_tokens_task: asyncio.Task[None] | None = None
+    solana_http_client: httpx.AsyncClient | None = None
 
 
 def _authorized(expected: str | None, authorization: str | None) -> bool:
@@ -138,12 +155,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             _signal_backtest_loop(runtime),
             name="momentum-signal-backtest",
         )
+        runtime.solana_http_client = httpx.AsyncClient(timeout=10.0)
+        runtime.solana_tokens = SolanaTokenEngine(
+            SolanaTokenClient(runtime.settings, runtime.solana_http_client)
+        )
+        if runtime.settings.solana_tokens_enabled:
+            runtime.solana_tokens_task = asyncio.create_task(
+                _solana_discovery_loop(runtime),
+                name="solana-token-discovery",
+            )
         try:
             await runtime.ingestion.start()
             yield
         finally:
             await runtime.ingestion.stop()
-            for task in (runtime.seed_task, runtime.signal_backtest_task):
+            for task in (
+                runtime.seed_task,
+                runtime.signal_backtest_task,
+                runtime.solana_tokens_task,
+            ):
                 if task is None:
                     continue
                 task.cancel()
@@ -151,6 +181,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     await task
                 except asyncio.CancelledError:
                     pass
+            if runtime.solana_http_client is not None:
+                await runtime.solana_http_client.aclose()
             await runtime.store.close()
 
     app = FastAPI(
@@ -480,6 +512,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "note": BACKTEST_NOTE,
         }
 
+    @v1.get("/solana/tokens/new")
+    async def solana_new_tokens(
+        limit: int = Query(default=50, ge=1, le=200),
+    ) -> dict[str, Any]:
+        engine = runtime.solana_tokens
+        if engine is None:
+            sources = [
+                {"name": source, "fetched_at": None, "ok": False, "error": None}
+                for source in SOURCE_NAMES
+            ]
+            return {
+                "status": "warming",
+                "updated_at": None,
+                "sources": sources,
+                "tokens": [],
+                "note": SOLANA_TOKENS_NOTE,
+            }
+        return {**engine.response(limit), "note": SOLANA_TOKENS_NOTE}
+
+    @v1.get("/solana/tokens/{mint}")
+    async def solana_token(mint: str) -> dict[str, Any]:
+        try:
+            validate_mint(mint)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+        engine = runtime.solana_tokens
+        if engine is not None:
+            try:
+                card = await engine.get_card(mint)
+            except NotTokenMint as error:
+                raise HTTPException(status_code=404, detail=str(error)) from error
+        else:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                on_demand = SolanaTokenEngine(SolanaTokenClient(runtime.settings, client))
+                try:
+                    card = await on_demand.get_card(mint)
+                except NotTokenMint as error:
+                    raise HTTPException(status_code=404, detail=str(error)) from error
+        return card.model_dump(mode="json")
+
     @v1.get("/snapshot")
     async def snapshot() -> dict[str, object]:
         events = sorted(
@@ -586,6 +659,37 @@ async def _signal_backtest_loop(
         except Exception:
             logger.exception("momentum signal backtest computation failed")
         await asyncio.sleep(SIGNAL_BACKTEST_REFRESH_SECONDS)
+
+
+async def _solana_discovery_cycle(engine: SolanaTokenEngine) -> None:
+    engine.schedule_retries()
+    await engine.discover_once()
+    await engine.refresh_markets_once()
+    engine.updated_at = datetime.now(UTC).isoformat()
+    engine.ready = True
+
+
+async def _solana_discovery_loop(runtime: Runtime) -> None:
+    engine = runtime.solana_tokens
+    if engine is None:
+        return
+    workers = [
+        asyncio.create_task(engine.worker(), name=f"solana-token-worker-{index}")
+        for index in range(SOLANA_TOKEN_WORKERS)
+    ]
+    try:
+        while True:
+            try:
+                await _solana_discovery_cycle(engine)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("Solana token discovery cycle failed")
+            await asyncio.sleep(SOLANA_TOKEN_REFRESH_SECONDS)
+    finally:
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
 
 
 async def _compute_signal_backtest(

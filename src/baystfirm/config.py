@@ -27,6 +27,7 @@ DEFAULT_SYMBOLS = ",".join(
         "SOL-USDT-PERP",
     )
 )
+DEFAULT_SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,9 @@ class Settings:
     shadow_mode: bool
     symbols: tuple[str, ...]
     api_key: str | None = None
+    solana_rpc_url: str = DEFAULT_SOLANA_RPC_URL
+    rugcheck_api_key: str | None = None
+    solana_tokens_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -55,4 +59,8 @@ class Settings:
             shadow_mode=os.getenv("BAYST_SHADOW_MODE", "true").lower() not in {"0", "false", "no"},
             symbols=symbols,
             api_key=os.getenv("BAYST_API_KEY", "").strip() or None,
+            solana_rpc_url=os.getenv("BAYST_SOLANA_RPC_URL", DEFAULT_SOLANA_RPC_URL),
+            rugcheck_api_key=os.getenv("BAYST_RUGCHECK_API_KEY", "").strip() or None,
+            solana_tokens_enabled=os.getenv("BAYST_SOLANA_TOKENS", "true").lower()
+            not in {"0", "false", "no"},
         )

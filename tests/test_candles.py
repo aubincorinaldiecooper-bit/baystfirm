@@ -33,6 +33,7 @@ def _settings(tmp_path: Path, venue: str, symbol: str) -> Settings:
         enabled_venues=(venue,),
         shadow_mode=True,
         symbols=(symbol,),
+        solana_tokens_enabled=False,
     )
 
 
@@ -184,6 +185,7 @@ async def test_unknown_pairs_and_spot_venue_perpetuals_are_not_found(tmp_path: P
         enabled_venues=("coinbase", "binanceus"),
         shadow_mode=True,
         symbols=("BTC-USD", "BTC-USDT-PERP"),
+        solana_tokens_enabled=False,
     )
     service = CandleService(settings, store)
 

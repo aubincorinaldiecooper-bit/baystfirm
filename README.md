@@ -170,6 +170,24 @@ replay refreshes every six hours. Live classifications use trades merged from al
 overlapping predictions are scored individually, so replay results can differ and intervals are
 optimistic.
 
+## Solana token discovery
+
+Authenticated `GET /v1/solana/tokens/new?limit=50` lists the latest Solana tokens discovered from
+GeckoTerminal; `limit` is 1–200. `GET /v1/solana/tokens/{mint}` returns an individual token card.
+The feed refreshes every 60 seconds, keeps at most 200 tokens, and loads cards in the background.
+Cards show sourced, timestamped facts from standard Solana JSON-RPC calls, DEX Screener,
+GeckoTerminal liquidity cross-checks, and the Raydium pool API. RPC is limited to 4 requests/s
+(largest-account requests to 1 per 2 seconds); DEX Screener to 4/s, GeckoTerminal to 1 per 2.5s,
+Raydium to 2/s, and RugCheck to 1/s.
+Market facts include the selected main pool's price/liquidity/volume plus all-pool count, total
+liquidity, total 24-hour volume, and the time of the full pool read.
+
+Our on-chain checks are presented first. RugCheck is explicitly a second opinion; Baystfirm does
+not issue an overall safe/unsafe verdict and does not provide wallets or trade execution. The RPC
+provider can be changed with `BAYST_SOLANA_RPC_URL`; its full URL is never logged or returned
+because provider URLs may contain credentials. Set `BAYST_RUGCHECK_API_KEY` to send RugCheck's
+optional `X-API-KEY` header. `BAYST_SOLANA_TOKENS=false` disables the background discovery loop.
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -179,6 +197,9 @@ optimistic.
 | `BAYST_SYMBOLS` | Majors, stablecoins, and perpetuals | Canonical instruments; each venue subscribes to the ones it lists |
 | `BAYST_SHADOW_MODE` | `true` | Prevent unvalidated classifications from becoming trusted |
 | `BAYST_API_KEY` | _(empty)_ | When set, every `/v1` route requires `Authorization: Bearer <key>` (`/health` stays open) |
+| `BAYST_SOLANA_RPC_URL` | `https://api.mainnet-beta.solana.com` | Swappable standard JSON-RPC endpoint; never logged or returned |
+| `BAYST_RUGCHECK_API_KEY` | _(empty)_ | Optional RugCheck API key, sent as `X-API-KEY` |
+| `BAYST_SOLANA_TOKENS` | `true` | Enable the background Solana token discovery loop |
 
 ## Implemented foundation
 

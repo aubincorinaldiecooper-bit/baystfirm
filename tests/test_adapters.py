@@ -24,6 +24,7 @@ def test_okx_swap_adapter_is_registered() -> None:
         enabled_venues=("okx",),
         shadow_mode=True,
         symbols=("BTC-USDT", "BTC-USDT-PERP"),
+        solana_tokens_enabled=False,
     )
     adapters = build_adapters(settings)
     assert [type(adapter) for adapter in adapters] == [OkxSpotAdapter, OkxSwapAdapter]
@@ -35,6 +36,7 @@ def test_binanceus_adapter_uses_only_verified_spot_symbols() -> None:
         enabled_venues=("binanceus",),
         shadow_mode=True,
         symbols=("BTC-USDT", "BTC-USDT-PERP", "PYUSD-USD", "USDC-USDT"),
+        solana_tokens_enabled=False,
     )
     adapters = build_adapters(settings)
     assert "binanceus" in DEFAULT_VENUES

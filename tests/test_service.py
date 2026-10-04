@@ -1,13 +1,17 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
+from solders.pubkey import Pubkey
 
 import baystfirm.candles as candle_module
 import baystfirm.service as service_module
 from baystfirm.config import Settings
 from baystfirm.models import Candle
 from baystfirm.service import create_app
+from baystfirm.solana_tokens import NotTokenMint, SolanaTokenClient, SolanaTokenEngine
 from tests.test_classifiers import stablecoin_trade
 
 
@@ -18,6 +22,7 @@ def test_health_and_evaluation_gate(tmp_path: Path) -> None:
             enabled_venues=(),
             shadow_mode=True,
             symbols=(),
+            solana_tokens_enabled=False,
         )
     )
     with TestClient(app) as client:
@@ -39,6 +44,7 @@ def _settings(tmp_path: Path, api_key: str | None = None) -> Settings:
         shadow_mode=True,
         symbols=("USDC-USD",),
         api_key=api_key,
+        solana_tokens_enabled=False,
     )
 
 
@@ -48,6 +54,11 @@ def test_api_key_guards_v1_routes(tmp_path: Path) -> None:
         assert client.get("/v1/snapshot").status_code == 401
         assert client.get("/v1/track-record").status_code == 401
         assert client.get("/v1/track-record/backtest").status_code == 401
+        assert client.get("/v1/solana/tokens/new").status_code == 401
+        assert (
+            client.get("/v1/solana/tokens/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263").status_code
+            == 401
+        )
         assert client.post("/v1/backtest", json=_backtest_body()).status_code == 401
         batch_body = _backtest_body()
         batch_body["also"] = [{"venue": "coinbase", "symbol": "ETH-USD"}]
@@ -69,6 +80,125 @@ def test_api_key_guards_v1_routes(tmp_path: Path) -> None:
             ).status_code
             == 200
         )
+        solana_feed = client.get(
+            "/v1/solana/tokens/new",
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert solana_feed.status_code == 200
+        assert solana_feed.json()["status"] == "warming"
+        assert (
+            client.get(
+                "/v1/solana/tokens/not-a-mint",
+                headers={"Authorization": "Bearer secret"},
+            ).status_code
+            == 400
+        )
+
+
+def test_solana_new_tokens_is_warming_before_first_cycle(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        response = client.get("/v1/solana/tokens/new")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert app.state.runtime.solana_tokens_task is None
+    assert body["status"] == "warming"
+    assert body["updated_at"] is None
+    assert body["tokens"] == []
+    assert [source["name"] for source in body["sources"]] == [
+        "solana_rpc",
+        "dexscreener",
+        "geckoterminal",
+        "raydium",
+        "rugcheck",
+    ]
+    assert body["note"] == service_module.SOLANA_TOKENS_NOTE
+
+
+def test_solana_detail_returns_404_for_non_token_mint(tmp_path: Path) -> None:
+    class NonMintEngine:
+        async def get_card(self, mint: str):
+            raise NotTokenMint("Address is not a token mint.")
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        app.state.runtime.solana_tokens = NonMintEngine()
+        response = client.get("/v1/solana/tokens/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Address is not a token mint."
+
+
+@pytest.mark.asyncio
+async def test_solana_discovery_cycle_bounds_feed_and_orders_newest_first() -> None:
+    mints = [str(Pubkey.new_unique()) for _ in range(205)]
+    included = [
+        {
+            "id": f"solana_{mint}",
+            "type": "token",
+            "attributes": {
+                "name": f"Token {index}",
+                "symbol": ("SOL", "USDC", "USDT")[index] if index < 3 else f"T{index}",
+            },
+        }
+        for index, mint in enumerate(mints)
+    ]
+    pools = [
+        {
+            "relationships": {
+                "base_token": {"data": {"id": f"solana_{mint}"}},
+            },
+        }
+        for mint in mints
+    ]
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "api.geckoterminal.com":
+            return httpx.Response(
+                200,
+                json={"data": pools, "included": included},
+            )
+        if request.url.host == "api.dexscreener.com":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        checker = SolanaTokenClient(
+            _solana_settings(),
+            client,
+            rate_limits={
+                "solana_rpc": 0.0,
+                "solana_largest": 0.0,
+                "dexscreener": 0.0,
+                "geckoterminal": 0.0,
+                "raydium": 0.0,
+                "rugcheck": 0.0,
+            },
+        )
+        engine = SolanaTokenEngine(checker)
+        await service_module._solana_discovery_cycle(engine)
+
+    response = engine.response(200)
+    assert engine.ready is True
+    assert len(response["tokens"]) == 200
+    assert response["tokens"][0]["mint"] == mints[-1]
+    assert response["tokens"][-1]["mint"] == mints[5]
+    assert all(token["symbol"] not in {"SOL", "USDC", "USDT"} for token in response["tokens"])
+    assert len([request for request in requests if request.url.host == "api.dexscreener.com"]) == 7
+
+
+def _solana_settings() -> Settings:
+    return Settings(
+        database_path=Path("unused-solana.db"),
+        enabled_venues=(),
+        shadow_mode=True,
+        symbols=(),
+        solana_rpc_url="https://solana.example.invalid",
+        solana_tokens_enabled=False,
+    )
 
 
 def test_track_record_window_hours_validation(tmp_path: Path) -> None:
@@ -97,6 +227,7 @@ def _strategy_settings(tmp_path: Path) -> Settings:
         enabled_venues=("coinbase",),
         shadow_mode=True,
         symbols=("BTC-USD",),
+        solana_tokens_enabled=False,
     )
 
 
@@ -120,6 +251,7 @@ def _batch_strategy_app(tmp_path: Path, monkeypatch) -> object:
             enabled_venues=("coinbase",),
             shadow_mode=True,
             symbols=("BTC-USD", "ETH-USD"),
+            solana_tokens_enabled=False,
         )
     )
     monkeypatch.setattr(service_module, "_seed_minute_bars", _no_background_work)
@@ -142,6 +274,7 @@ def _signal_backtest_app(
             enabled_venues=enabled_venues,
             shadow_mode=True,
             symbols=symbols,
+            solana_tokens_enabled=False,
         )
     )
     monkeypatch.setattr(service_module, "_seed_minute_bars", _no_background_work)

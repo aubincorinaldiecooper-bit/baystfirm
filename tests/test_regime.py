@@ -216,6 +216,7 @@ async def test_seeding_uses_stubbed_candle_source_and_only_closed_bars() -> None
         enabled_venues=("coinbase", "kraken"),
         shadow_mode=True,
         symbols=("BTC-USD",),
+        solana_tokens_enabled=False,
     )
     classifier = MomentumRegimeClassifier()
     minute_open_ms = int(datetime.now(UTC).timestamp() // 60 * 60_000)
@@ -266,6 +267,7 @@ async def test_seeding_falls_back_in_venue_order_for_perpetuals() -> None:
         enabled_venues=("bybit", "okx", "coinbase"),
         shadow_mode=True,
         symbols=("BTC-USDT-PERP",),
+        solana_tokens_enabled=False,
     )
     classifier = MomentumRegimeClassifier()
     now_minute_ms = int(datetime.now(UTC).timestamp() // 60 * 60_000)
@@ -301,6 +303,7 @@ async def test_service_seeding_prepends_after_live_trades() -> None:
         enabled_venues=("coinbase",),
         shadow_mode=True,
         symbols=("BTC-USD",),
+        solana_tokens_enabled=False,
     )
     classifier = MomentumRegimeClassifier()
     minute_open_ms = int(datetime.now(UTC).timestamp() // 60 * 60_000)

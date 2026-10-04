@@ -53,6 +53,8 @@ Evaluate externally labeled newline-delimited prediction records:
 .venv/bin/baystfirm evaluate evaluation-records.jsonl
 ```
 
+The promotion gate also requires at least 0.5 macro recall across labels present in the expected outcomes; abstentions count as misses.
+
 Import official Binance spot aggregate trades into the event database, timestamped CSV ticks, or
 both. Repeat `--date` for each UTC archive day; at least one output is required:
 

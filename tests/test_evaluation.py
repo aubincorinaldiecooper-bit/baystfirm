@@ -1,5 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from baystfirm.evaluation import (
     EvaluationRecord,
     PromotionGate,
@@ -27,6 +29,41 @@ def test_abstentions_reduce_coverage() -> None:
     metrics = evaluate(records)
     assert metrics.coverage == 0.5
     assert metrics.accuracy == 1
+
+
+def test_always_normal_fails_macro_recall_on_imbalanced_data() -> None:
+    records = [
+        EvaluationRecord("range_bound", label, 0.98, False, 10, "range_bound")
+        for label, count in (
+            ("range_bound", 980),
+            ("downward_momentum", 10),
+            ("upward_momentum", 10),
+        )
+        for _ in range(count)
+    ]
+    metrics = evaluate(records)
+    assert metrics.accuracy == 0.98
+    assert metrics.macro_recall == pytest.approx(1 / 3)
+    assert PromotionGate().failures(metrics) == ["macro_recall_below_threshold"]
+
+
+def test_abstentions_count_as_recall_misses() -> None:
+    metrics = evaluate(
+        [
+            EvaluationRecord("upward_momentum", "upward_momentum", 0.9, True, 10, "range_bound"),
+            EvaluationRecord("range_bound", "range_bound", 0.9, False, 10, "range_bound"),
+        ]
+    )
+    assert metrics.label_recall == {"range_bound": 1.0, "upward_momentum": 0.0}
+    assert metrics.macro_recall == 0.5
+
+
+def test_recall_uses_only_labels_present_in_expected_records() -> None:
+    metrics = evaluate(
+        [EvaluationRecord("upward_momentum", "upward_momentum", 0.9, False, 10, "range_bound")]
+    )
+    assert metrics.label_recall == {"upward_momentum": 1.0}
+    assert metrics.macro_recall == 1.0
 
 
 def prediction(label: str, seconds: int, abstained: bool = False) -> Classification:

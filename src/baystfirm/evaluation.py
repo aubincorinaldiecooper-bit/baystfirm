@@ -4,7 +4,7 @@ import math
 from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from statistics import mean
 
@@ -42,6 +42,8 @@ class EvaluationMetrics:
     brier_score: float
     expected_calibration_error: float
     p95_latency_ms: float
+    macro_recall: float = 0.0
+    label_recall: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,7 @@ class PromotionGate:
     minimum_samples: int = 500
     minimum_coverage: float = 0.8
     minimum_accuracy: float = 0.9
+    minimum_macro_recall: float = 0.5
     maximum_false_alert_rate: float = 0.05
     maximum_brier_score: float = 0.15
     maximum_ece: float = 0.1
@@ -59,6 +62,10 @@ class PromotionGate:
             (metrics.sample_count < self.minimum_samples, "insufficient_samples"),
             (metrics.coverage < self.minimum_coverage, "coverage_below_threshold"),
             (metrics.accuracy < self.minimum_accuracy, "accuracy_below_threshold"),
+            (
+                metrics.macro_recall < self.minimum_macro_recall,
+                "macro_recall_below_threshold",
+            ),
             (
                 metrics.false_alert_rate > self.maximum_false_alert_rate,
                 "false_alert_rate_above_threshold",
@@ -91,6 +98,16 @@ def evaluate(records: list[EvaluationRecord], bins: int = 10) -> EvaluationMetri
         else 1.0
     )
     ece = _expected_calibration_error(covered, bins)
+    label_recall = {
+        label: sum(
+            not record.abstained
+            and record.expected_label == label
+            and record.predicted_label == label
+            for record in records
+        )
+        / sum(record.expected_label == label for record in records)
+        for label in sorted({record.expected_label for record in records})
+    }
     latencies = sorted(record.latency_ms for record in records)
     p95_index = max(0, math.ceil(len(latencies) * 0.95) - 1)
     return EvaluationMetrics(
@@ -101,6 +118,8 @@ def evaluate(records: list[EvaluationRecord], bins: int = 10) -> EvaluationMetri
         brier_score=brier,
         expected_calibration_error=ece,
         p95_latency_ms=latencies[p95_index],
+        macro_recall=mean(label_recall.values()),
+        label_recall=label_recall,
     )
 
 

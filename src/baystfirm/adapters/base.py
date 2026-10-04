@@ -3,19 +3,23 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 import websockets
 
-from baystfirm.models import MarketEvent
+from baystfirm.models import EventType, MarketEvent
 
 logger = logging.getLogger(__name__)
 EmitEvent = Callable[[MarketEvent], Awaitable[None]]
 
 
 STABLE_QUOTES = frozenset({"USDT", "USDC"})
+THROTTLED_EVENT_TYPES = frozenset(
+    {EventType.BOOK, EventType.QUOTE, EventType.FUNDING, EventType.OPEN_INTEREST}
+)
 
 
 def split_symbol(symbol: str) -> tuple[str, str]:
@@ -27,8 +31,26 @@ class MarketAdapter(ABC):
     name: str
     websocket_url: str
 
-    def __init__(self, symbols: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        symbols: tuple[str, ...],
+        *,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
         self.symbols = symbols
+        self._clock = clock or time.monotonic
+        self._last_emitted_at: dict[tuple[str, str, EventType], float] = {}
+
+    def should_emit(self, event: MarketEvent) -> bool:
+        if event.event_type not in THROTTLED_EVENT_TYPES:
+            return True
+        key = (event.venue, event.symbol, event.event_type)
+        now = self._clock()
+        last = self._last_emitted_at.get(key)
+        if last is not None and now - last < 1.0:
+            return False
+        self._last_emitted_at[key] = now
+        return True
 
     @abstractmethod
     def subscription_messages(self) -> list[dict[str, Any]]:
@@ -61,7 +83,8 @@ class MarketAdapter(ABC):
                             logger.warning("%s sent an unparseable message", self.name)
                             continue
                         for event in events:
-                            await emit(event)
+                            if self.should_emit(event):
+                                await emit(event)
             except TimeoutError:
                 logger.warning("%s market stream timed out", self.name)
             except asyncio.CancelledError:

@@ -56,6 +56,18 @@ def test_stablecoin_quoted_pairs_are_converted_to_usd() -> None:
     assert evidence["cross_venue_median_usd_price"] == 0.995
 
 
+def test_market_classifier_ignores_non_trade_market_events() -> None:
+    classifier = MarketStateClassifier()
+    trade = stablecoin_trade("bybit", 50_000, symbol="BTC-USDT")
+    classifier.observe(trade)
+
+    for event_type in (EventType.BOOK, EventType.FUNDING, EventType.LIQUIDATION):
+        event = trade.model_copy(update={"event_type": event_type})
+        assert classifier.observe(event) == []
+
+    assert list(classifier._history["BTC-USDT"]) == [trade]
+
+
 def test_momentum_survives_more_than_500_trades_in_30_seconds() -> None:
     classifier = MarketStateClassifier()
     start = datetime(2025, 1, 1, tzinfo=UTC)

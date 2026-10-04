@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from baystfirm.classifiers import MarketStateClassifier
 from baystfirm.hub import EventHub
-from baystfirm.models import Classification, MarketEvent
+from baystfirm.models import Classification, EventType, MarketEvent
 from baystfirm.storage import EventStore
 
 
@@ -17,12 +17,12 @@ class IntelligencePipeline:
         self.hub = hub
         self.classifier = classifier
         self.classifications_generated = 0
-        self.latest_events: dict[tuple[str, str], MarketEvent] = {}
+        self.latest_events: dict[tuple[str, str, EventType], MarketEvent] = {}
         self.latest_classifications: dict[tuple[str, str], Classification] = {}
 
     async def ingest(self, event: MarketEvent) -> None:
         await self.store.append_event(event)
-        self.latest_events[(event.venue, event.symbol)] = event
+        self.latest_events[(event.venue, event.symbol, event.event_type)] = event
         await self.hub.publish(event)
         for classification in self.classifier.observe(event):
             await self.store.append_classification(classification)

@@ -6,7 +6,7 @@ import logging
 import math
 import struct
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -58,12 +58,18 @@ SOURCE_RATE_LIMITS = {
     "solana_rpc": 0.25,
     "solana_largest": 0.5,
     "dexscreener": 0.25,
-    "geckoterminal": 2.5,
     "raydium": 0.5,
     "rugcheck": 1.0,
 }
 TOP_HOLDER_RETRY_SECONDS = 600
+TOP_HOLDER_RATE_LIMIT_RETRY_SECONDS = 60
 MAX_TOP_HOLDER_ATTEMPTS = 6
+GECKOTERMINAL_BUCKET_CAPACITY = 10.0
+GECKOTERMINAL_REFILL_SECONDS = 6.0
+GECKOTERMINAL_BACKGROUND_RESERVE = 3.0
+GECKOTERMINAL_INTERACTIVE_TIMEOUT_SECONDS = 5.0
+GECKOTERMINAL_INITIAL_BACKOFF_SECONDS = 60.0
+GECKOTERMINAL_MAX_BACKOFF_SECONDS = 600.0
 DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/tokens/v1/solana"
 DEXSCREENER_TOKEN_PAIRS_URL = "https://api.dexscreener.com/token-pairs/v1/solana"
 DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
@@ -168,6 +174,132 @@ class AsyncRateLimiter:
             self._last_request = self.clock()
 
 
+class GeckoTerminalTokenBucket:
+    def __init__(
+        self,
+        *,
+        capacity: float = GECKOTERMINAL_BUCKET_CAPACITY,
+        refill_seconds: float = GECKOTERMINAL_REFILL_SECONDS,
+        background_reserve: float = GECKOTERMINAL_BACKGROUND_RESERVE,
+        interactive_timeout_seconds: float = GECKOTERMINAL_INTERACTIVE_TIMEOUT_SECONDS,
+        clock: Callable[[], float] = monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self.capacity = capacity
+        self.refill_seconds = refill_seconds
+        self.background_reserve = background_reserve
+        self.interactive_timeout_seconds = interactive_timeout_seconds
+        self.clock = clock
+        self.sleep = sleep
+        self._tokens = capacity
+        self._last_refill = clock()
+        self._paused_until = 0.0
+        self._backoff_seconds = GECKOTERMINAL_INITIAL_BACKOFF_SECONDS
+        self._lock = asyncio.Lock()
+
+    @property
+    def tokens(self) -> float:
+        self._refill(self.clock())
+        return self._tokens
+
+    @property
+    def backoff_seconds(self) -> float:
+        return self._backoff_seconds
+
+    @property
+    def pause_remaining(self) -> float:
+        return max(0.0, self._paused_until - self.clock())
+
+    def _refill(self, now: float) -> None:
+        elapsed = max(0.0, now - self._last_refill)
+        if elapsed:
+            self._tokens = min(
+                self.capacity,
+                self._tokens + elapsed / self.refill_seconds,
+            )
+            self._last_refill = now
+
+    async def wait(self, *, priority: Literal["background", "interactive"] = "background") -> None:
+        started_at = self.clock()
+        deadline = (
+            started_at + self.interactive_timeout_seconds if priority == "interactive" else None
+        )
+        while True:
+            async with self._lock:
+                now = self.clock()
+                self._refill(now)
+                if deadline is not None and now > deadline:
+                    raise SourceError(
+                        "geckoterminal",
+                        "Couldn't check right now (rate limited)",
+                    )
+                pause_delay = self._paused_until - now
+                if pause_delay > 0:
+                    if priority == "interactive":
+                        raise SourceError(
+                            "geckoterminal",
+                            "Couldn't check right now (rate limited)",
+                        )
+                    delay = pause_delay
+                else:
+                    reserve = self.background_reserve if priority == "background" else 0.0
+                    if self._tokens >= 1.0 and (
+                        priority == "interactive" or self._tokens > reserve
+                    ):
+                        self._tokens -= 1.0
+                        return
+                    if priority == "background":
+                        delay = (
+                            max(
+                                (reserve - self._tokens) * self.refill_seconds,
+                                (1.0 - self._tokens) * self.refill_seconds,
+                            )
+                            + 1e-6
+                        )
+                    else:
+                        remaining = (deadline or now) - now
+                        if remaining <= 0:
+                            raise SourceError(
+                                "geckoterminal",
+                                "Couldn't check right now (rate limited)",
+                            )
+                        delay = min((1.0 - self._tokens) * self.refill_seconds, remaining)
+            await self.sleep(delay)
+            if deadline is not None and self.clock() >= deadline:
+                async with self._lock:
+                    now = self.clock()
+                    self._refill(now)
+                    if now < self._paused_until or self._tokens < 1.0:
+                        raise SourceError(
+                            "geckoterminal",
+                            "Couldn't check right now (rate limited)",
+                        )
+
+    def record_rate_limit(self, retry_after: str | None = None) -> None:
+        delay = self._retry_after_seconds(retry_after)
+        if delay is None:
+            delay = self._backoff_seconds
+        delay = min(delay, GECKOTERMINAL_MAX_BACKOFF_SECONDS)
+        self._paused_until = max(self._paused_until, self.clock() + delay)
+        self._backoff_seconds = min(
+            self._backoff_seconds * 2,
+            GECKOTERMINAL_MAX_BACKOFF_SECONDS,
+        )
+
+    def record_success(self) -> None:
+        self._backoff_seconds = GECKOTERMINAL_INITIAL_BACKOFF_SECONDS
+
+    @staticmethod
+    def _retry_after_seconds(value: str | None) -> float | None:
+        if value is None:
+            return None
+        try:
+            seconds = float(value)
+        except ValueError:
+            return None
+        return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
+
 def unavailable_fact(
     source: FactSource,
     detail: str,
@@ -183,6 +315,15 @@ def _iso_now() -> str:
 
 def _source_status(source: FactSource) -> dict[str, Any]:
     return {"name": source, "fetched_at": None, "ok": False, "error": None}
+
+
+def _is_geckoterminal_rate_limit(fact: Fact) -> bool:
+    return (
+        fact.status == "unavailable"
+        and fact.source == "geckoterminal"
+        and fact.detail is not None
+        and "rate limited" in fact.detail.casefold()
+    )
 
 
 def _optional_float(value: Any) -> float | None:
@@ -377,13 +518,19 @@ class SolanaTokenClient:
         client: httpx.AsyncClient,
         *,
         rate_limits: Mapping[str, float] | None = None,
+        gecko_bucket: GeckoTerminalTokenBucket | None = None,
     ) -> None:
         self.settings = settings
         self.client = client
         limits = dict(SOURCE_RATE_LIMITS)
         if rate_limits is not None:
             limits.update(rate_limits)
-        self._limiters = {source: AsyncRateLimiter(interval) for source, interval in limits.items()}
+        self._limiters = {
+            source: AsyncRateLimiter(interval)
+            for source, interval in limits.items()
+            if source != "geckoterminal"
+        }
+        self._gecko_bucket = gecko_bucket or GeckoTerminalTokenBucket()
         self.sources = {source: _source_status(source) for source in SOURCE_NAMES}
         self._request_id = 0
 
@@ -452,18 +599,30 @@ class SolanaTokenClient:
         *,
         params: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
+        priority: Literal["background", "interactive"] = "background",
     ) -> Any:
-        await self._limiters[source].wait()
+        try:
+            if source == "geckoterminal":
+                await self._gecko_bucket.wait(priority=priority)
+            else:
+                await self._limiters[source].wait()
+        except SourceError as error:
+            self._mark_failure(source, error.detail)
+            raise
         try:
             response = await self.client.get(url, params=params, headers=headers)
         except httpx.HTTPError as error:
             raise self._request_error(source, url, None) from error
         if response.status_code >= 400:
+            if source == "geckoterminal" and response.status_code == 429:
+                self._gecko_bucket.record_rate_limit(response.headers.get("Retry-After"))
             raise self._request_error(source, url, response.status_code)
         try:
             body = response.json()
         except ValueError as error:
             raise self._request_error(source, url, response.status_code) from error
+        if source == "geckoterminal":
+            self._gecko_bucket.record_success()
         self._mark_success(source)
         return body
 
@@ -503,6 +662,8 @@ class SolanaTokenClient:
         timeframe: str,
         aggregate: int,
         limit: int,
+        *,
+        priority: Literal["background", "interactive"] = "background",
     ) -> Any:
         return await self.get_json(
             "geckoterminal",
@@ -513,12 +674,19 @@ class SolanaTokenClient:
                 "currency": "usd",
                 "token": mint,
             },
+            priority=priority,
         )
 
-    async def gecko_liquidity(self, pool_address: str) -> float | None:
+    async def gecko_liquidity(
+        self,
+        pool_address: str,
+        *,
+        priority: Literal["background", "interactive"] = "background",
+    ) -> float | None:
         body = await self.get_json(
             "geckoterminal",
             f"{GECKOTERMINAL_POOLS_URL}/{pool_address}",
+            priority=priority,
         )
         data = body.get("data") if isinstance(body, dict) else None
         attributes = data.get("attributes") if isinstance(data, dict) else None
@@ -531,6 +699,7 @@ class SolanaTokenClient:
         mint: str,
         *,
         gecko_cross_check: bool,
+        priority: Literal["background", "interactive"] = "background",
     ) -> tuple[Fact, Fact, list[dict[str, Any]], str | None, str | None]:
         try:
             pairs = await self.get_token_pairs(mint)
@@ -550,7 +719,10 @@ class SolanaTokenClient:
         gecko_liquidity: float | None = None
         if gecko_cross_check and pool_address:
             try:
-                gecko_liquidity = await self.gecko_liquidity(pool_address)
+                gecko_liquidity = await self.gecko_liquidity(
+                    pool_address,
+                    priority=priority,
+                )
             except SourceError:
                 gecko_liquidity = None
         value = market_value(
@@ -645,9 +817,15 @@ class SolanaTokenClient:
             fetched_at=_iso_now(),
         )
 
-    async def top10_share(self, mint: str, pool_addresses: set[str]) -> Fact:
+    async def top10_share(
+        self,
+        mint: str,
+        pool_addresses: set[str],
+        *,
+        priority: Literal["background", "interactive"] = "background",
+    ) -> Fact:
         if self.settings.solana_rpc_url == DEFAULT_SOLANA_RPC_URL:
-            return await self.geckoterminal_top10_share(mint)
+            return await self.geckoterminal_top10_share(mint, priority=priority)
         try:
             largest_result = await self.rpc(
                 "getTokenLargestAccounts",
@@ -719,13 +897,19 @@ class SolanaTokenClient:
             }
             return Fact(status="ok", value=value, source="solana_rpc", fetched_at=_iso_now())
         except SourceError:
-            return await self.geckoterminal_top10_share(mint)
+            return await self.geckoterminal_top10_share(mint, priority=priority)
 
-    async def geckoterminal_top10_share(self, mint: str) -> Fact:
+    async def geckoterminal_top10_share(
+        self,
+        mint: str,
+        *,
+        priority: Literal["background", "interactive"] = "background",
+    ) -> Fact:
         try:
             body = await self.get_json(
                 "geckoterminal",
                 f"{GECKOTERMINAL_TOKEN_INFO_URL}/{mint}/info",
+                priority=priority,
             )
         except SourceError as error:
             return unavailable_fact(
@@ -1295,14 +1479,17 @@ class SolanaTokenEngine:
                         mint,
                         self._pool_addresses.get(mint, set()),
                     )
-                    attempts = self._top_retry_count.get(mint, 0) + 1
-                    self._top_retry_count[mint] = attempts
-                    if fact.status == "unavailable" and attempts < MAX_TOP_HOLDER_ATTEMPTS:
-                        self._top_retry_at[mint] = monotonic() + TOP_HOLDER_RETRY_SECONDS
+                    if _is_geckoterminal_rate_limit(fact):
+                        self._top_retry_at[mint] = monotonic() + TOP_HOLDER_RATE_LIMIT_RETRY_SECONDS
                     else:
-                        self._top_retry_at.pop(mint, None)
-                        if fact.status == "ok":
-                            self._top_retry_count.pop(mint, None)
+                        attempts = self._top_retry_count.get(mint, 0) + 1
+                        self._top_retry_count[mint] = attempts
+                        if fact.status == "unavailable" and attempts < MAX_TOP_HOLDER_ATTEMPTS:
+                            self._top_retry_at[mint] = monotonic() + TOP_HOLDER_RETRY_SECONDS
+                        else:
+                            self._top_retry_at.pop(mint, None)
+                            if fact.status == "ok":
+                                self._top_retry_count.pop(mint, None)
                     self._update_facts(mint, top10_share=fact)
                 elif kind == "rugcheck":
                     stored_card = self.tokens.get(mint)
@@ -1320,22 +1507,32 @@ class SolanaTokenEngine:
                             update={"second_opinion": opinion}
                         )
                     self._rug_retry_at.pop(mint, None)
-            except Exception:
+            except Exception as error:
                 logger.warning("could not refresh Solana token facts mint=%s", mint)
                 if kind == "card":
                     self._update_all_unavailable(mint, "Couldn't check right now")
                 elif kind == "top10":
-                    attempts = self._top_retry_count.get(mint, 0) + 1
-                    self._top_retry_count[mint] = attempts
-                    if attempts < MAX_TOP_HOLDER_ATTEMPTS:
-                        self._top_retry_at[mint] = monotonic() + TOP_HOLDER_RETRY_SECONDS
+                    rate_limited = (
+                        isinstance(error, SourceError)
+                        and error.source == "geckoterminal"
+                        and "rate limited" in error.detail.casefold()
+                    )
+                    if rate_limited:
+                        self._top_retry_at[mint] = monotonic() + TOP_HOLDER_RATE_LIMIT_RETRY_SECONDS
                     else:
-                        self._top_retry_at.pop(mint, None)
+                        attempts = self._top_retry_count.get(mint, 0) + 1
+                        self._top_retry_count[mint] = attempts
+                        if attempts < MAX_TOP_HOLDER_ATTEMPTS:
+                            self._top_retry_at[mint] = monotonic() + TOP_HOLDER_RETRY_SECONDS
+                        else:
+                            self._top_retry_at.pop(mint, None)
                     self._update_facts(
                         mint,
                         top10_share=unavailable_fact(
                             "geckoterminal",
-                            "Couldn't check right now",
+                            error.detail
+                            if isinstance(error, SourceError)
+                            else "Couldn't check right now",
                             fetched_at=_iso_now(),
                         ),
                     )
@@ -1364,6 +1561,7 @@ class SolanaTokenEngine:
         gecko_cross_check: bool = True,
         fetch_top10: bool = True,
         fetch_rugcheck: bool = True,
+        geckoterminal_priority: Literal["background", "interactive"] = "background",
     ) -> TokenCard:
         validate_mint(mint)
         now = _iso_now()
@@ -1460,6 +1658,7 @@ class SolanaTokenEngine:
         market_fact, lock_fact, pairs, dex_name, dex_symbol = await self.checker.market_and_lock(
             mint,
             gecko_cross_check=gecko_cross_check,
+            priority=geckoterminal_priority,
         )
         facts["market"] = market_fact
         facts["liquidity_lock"] = lock_fact
@@ -1469,7 +1668,11 @@ class SolanaTokenEngine:
         if existing is not None:
             self._pool_addresses[mint] = pool_addresses
         if fetch_top10:
-            facts["top10_share"] = await self.checker.top10_share(mint, pool_addresses)
+            facts["top10_share"] = await self.checker.top10_share(
+                mint,
+                pool_addresses,
+                priority=geckoterminal_priority,
+            )
         else:
             facts["top10_share"] = unavailable_fact("geckoterminal", "Check pending")
         opinion = (
@@ -1531,6 +1734,7 @@ class SolanaTokenEngine:
             first_seen_at=existing.first_seen_at if existing is not None else None,
             gecko_cross_check=True,
             fetch_rugcheck=fetch_rugcheck,
+            geckoterminal_priority="interactive",
         )
         if existing is not None:
             self._store_card(card, checked=True)
@@ -1545,6 +1749,8 @@ class SolanaTokenEngine:
         if top_fact.status == "ok":
             self._top_retry_count.pop(card.mint, None)
             self._top_retry_at.pop(card.mint, None)
+        elif _is_geckoterminal_rate_limit(top_fact):
+            self._top_retry_at[card.mint] = monotonic() + TOP_HOLDER_RATE_LIMIT_RETRY_SECONDS
         elif top_fact.detail != "Check pending":
             self._top_retry_at.setdefault(card.mint, monotonic() + TOP_HOLDER_RETRY_SECONDS)
         if (

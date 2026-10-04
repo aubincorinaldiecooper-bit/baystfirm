@@ -701,6 +701,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 timeframe,
                 aggregate,
                 limit,
+                priority="interactive",
             )
             candle_rows = _parse_geckoterminal_candles(body, limit)
         except (SourceError, ValueError) as error:

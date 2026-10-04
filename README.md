@@ -186,9 +186,11 @@ distribution by default; it may include pool and exchange accounts, which GeckoT
 identify. A custom RPC URL tries account-level holder checks first and falls back to
 GeckoTerminal. Feed card builds skip the optional GeckoTerminal liquidity cross-check; individual
 detail cards retain it. RPC is limited to 4 requests/s (largest-account requests, when a custom RPC
-is used, to 1 per 2 seconds); DEX Screener to 4/s; GeckoTerminal to 1 per 2.5 seconds shared across
-new-pool discovery, holder lookups, detail liquidity cross-checks, and token candles; Raydium to
-2/s; and RugCheck to 1/s.
+is used, to 1 per 2 seconds); DEX Screener to 4/s; the keyless GeckoTerminal API is budgeted at
+approximately 10 calls/minute with a shared token bucket. Background discovery and holder work
+leave a three-token reserve for interactive detail and candle requests. GeckoTerminal 429 responses
+pause shared callers with Retry-After or exponential backoff; interactive calls wait at most five
+seconds for a token. Raydium is limited to 2/s and RugCheck to 1/s.
 Market facts include the selected main pool's price/liquidity/volume plus all-pool count, total
 liquidity, total 24-hour volume, and the time of the full pool read.
 

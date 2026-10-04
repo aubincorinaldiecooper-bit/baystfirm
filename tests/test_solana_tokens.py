@@ -17,6 +17,7 @@ from baystfirm.solana_tokens import (
     METADATA_PROGRAM,
     SPL_TOKEN_PROGRAM,
     TOKEN_2022_PROGRAM,
+    GeckoTerminalTokenBucket,
     NotTokenMint,
     SolanaTokenClient,
     SolanaTokenEngine,
@@ -42,6 +43,22 @@ RATE_LIMITS_OFF = {
     "raydium": 0.0,
     "rugcheck": 0.0,
 }
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def time(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.advance(seconds)
 
 
 def _settings(
@@ -92,6 +109,124 @@ def test_validate_mint_and_metadata_pda_use_solders_pubkeys() -> None:
     )
     with pytest.raises(ValueError, match="32-byte base58"):
         validate_mint("not-a-mint")
+
+
+@pytest.mark.asyncio
+async def test_geckoterminal_bucket_refills_one_token_every_six_seconds() -> None:
+    clock = FakeClock()
+    bucket = GeckoTerminalTokenBucket(clock=clock.time, sleep=clock.sleep)
+
+    for _ in range(10):
+        await bucket.wait(priority="interactive")
+    assert bucket.tokens == 0
+
+    clock.advance(12)
+    assert bucket.tokens == 2
+    await bucket.wait(priority="interactive")
+    assert bucket.tokens == 1
+
+
+@pytest.mark.asyncio
+async def test_background_reserves_three_tokens_for_interactive_requests() -> None:
+    clock = FakeClock()
+    bucket = GeckoTerminalTokenBucket(clock=clock.time, sleep=clock.sleep)
+
+    for _ in range(7):
+        await bucket.wait(priority="background")
+    assert bucket.tokens == 3
+
+    sleeps_before_interactive = len(clock.sleeps)
+    await bucket.wait(priority="interactive")
+    assert len(clock.sleeps) == sleeps_before_interactive
+    assert bucket.tokens == 2
+
+    await bucket.wait(priority="background")
+    assert clock.sleeps[-1] > 6
+    assert bucket.tokens <= 2.000001
+
+
+@pytest.mark.asyncio
+async def test_interactive_fails_fast_during_pause_while_background_waits() -> None:
+    clock = FakeClock()
+    bucket = GeckoTerminalTokenBucket(clock=clock.time, sleep=clock.sleep)
+    bucket.record_rate_limit("9")
+
+    with pytest.raises(SourceError, match="rate limited"):
+        await bucket.wait(priority="interactive")
+    assert clock.sleeps == []
+
+    await bucket.wait(priority="background")
+    assert clock.now == 9
+    assert clock.sleeps == [9]
+
+
+@pytest.mark.asyncio
+async def test_interactive_bucket_timeout_does_not_issue_http_request() -> None:
+    clock = FakeClock()
+    bucket = GeckoTerminalTokenBucket(clock=clock.time, sleep=clock.sleep)
+    for _ in range(10):
+        await bucket.wait(priority="interactive")
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        checker = SolanaTokenClient(_settings(), http, gecko_bucket=bucket)
+        with pytest.raises(SourceError, match="Couldn't check right now \\(rate limited\\)"):
+            await checker.get_json(
+                "geckoterminal",
+                "https://api.geckoterminal.com/test",
+                priority="interactive",
+            )
+
+    assert requests == []
+    assert clock.now == 5
+
+
+@pytest.mark.asyncio
+async def test_geckoterminal_429_retry_after_and_success_reset_backoff() -> None:
+    clock = FakeClock()
+    bucket = GeckoTerminalTokenBucket(clock=clock.time, sleep=clock.sleep)
+    responses = [
+        httpx.Response(429, headers={"Retry-After": "17"}),
+        httpx.Response(200, json={"ok": True}),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return responses.pop(0)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        checker = SolanaTokenClient(_settings(), http, gecko_bucket=bucket)
+        with pytest.raises(SourceError):
+            await checker.get_json("geckoterminal", "https://api.geckoterminal.com/test")
+        assert bucket.pause_remaining == 17
+
+        clock.advance(17)
+        assert await checker.get_json("geckoterminal", "https://api.geckoterminal.com/test")
+        assert bucket.backoff_seconds == 60
+
+
+@pytest.mark.asyncio
+async def test_geckoterminal_429_without_header_doubles_backoff_to_ten_minutes() -> None:
+    clock = FakeClock()
+    bucket = GeckoTerminalTokenBucket(clock=clock.time, sleep=clock.sleep)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(429))
+    ) as http:
+        checker = SolanaTokenClient(_settings(), http, gecko_bucket=bucket)
+        with pytest.raises(SourceError):
+            await checker.get_json("geckoterminal", "https://api.geckoterminal.com/test")
+
+    assert bucket.pause_remaining == 60
+    for pause in (120, 240, 480, 600, 600):
+        clock.advance(bucket.pause_remaining)
+        bucket.record_rate_limit()
+        assert bucket.pause_remaining == pause
+    bucket.record_success()
+    assert bucket.backoff_seconds == 60
 
 
 def test_parse_spl_mint_with_revoked_authorities() -> None:
@@ -514,7 +649,9 @@ async def test_feed_card_queues_holder_lookup_without_liquidity_cross_check(
             *,
             first_seen_at: str,
             gecko_cross_check: bool,
-            fetch_top10: bool,
+            fetch_top10: bool = True,
+            fetch_rugcheck: bool = True,
+            geckoterminal_priority: str = "background",
         ) -> Any:
             calls.append(
                 {
@@ -522,6 +659,7 @@ async def test_feed_card_queues_holder_lookup_without_liquidity_cross_check(
                     "first_seen_at": first_seen_at,
                     "gecko_cross_check": gecko_cross_check,
                     "fetch_top10": fetch_top10,
+                    "geckoterminal_priority": geckoterminal_priority,
                 }
             )
             return card
@@ -542,8 +680,11 @@ async def test_feed_card_queues_holder_lookup_without_liquidity_cross_check(
             "first_seen_at": card.first_seen_at,
             "gecko_cross_check": False,
             "fetch_top10": False,
+            "geckoterminal_priority": "background",
         }
     ]
+    await engine.get_card(MINT, max_age_seconds=0)
+    assert calls[-1]["geckoterminal_priority"] == "interactive"
     engine.schedule_retries()
     assert ("top10", MINT) in engine._queued
 
@@ -970,7 +1111,10 @@ async def test_holder_retries_wait_ten_minutes_and_stop_after_six_attempts(
 
     def handler(request: httpx.Request) -> httpx.Response:
         holder_requests.append(request)
-        return httpx.Response(429)
+        return httpx.Response(
+            200,
+            json={"data": {"attributes": {"holders": None}}},
+        )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         engine = SolanaTokenEngine(
@@ -1012,4 +1156,64 @@ async def test_holder_retries_wait_ten_minutes_and_stop_after_six_attempts(
 
     assert len(holder_requests) == 6
     assert all(request.method == "GET" for request in holder_requests)
-    assert engine.tokens[MINT].facts.top10_share.detail == "Couldn't check right now (rate limited)"
+    assert engine.tokens[MINT].facts.top10_share.detail == "No holder data from GeckoTerminal yet"
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_holder_retry_waits_one_minute_without_counting_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 1_000.0
+    monkeypatch.setattr(solana_module, "monotonic", lambda: now)
+    holder_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        holder_requests.append(request)
+        return httpx.Response(429)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        engine = SolanaTokenEngine(
+            SolanaTokenClient(
+                _settings(solana_rpc_url=DEFAULT_SOLANA_RPC_URL),
+                http,
+                rate_limits=RATE_LIMITS_OFF,
+            )
+        )
+        card = solana_module._pending_card(
+            MINT,
+            "Bonk",
+            "BONK",
+            "2026-10-04T00:00:00+00:00",
+        )
+        facts = card.facts.model_copy(
+            update={
+                "top10_share": unavailable_fact(
+                    "geckoterminal",
+                    "Check pending",
+                )
+            }
+        )
+        engine.tokens[MINT] = card.model_copy(update={"facts": facts})
+        engine._checked_at[MINT] = now
+        engine._queue_work("top10", MINT)
+        worker = asyncio.create_task(engine.worker())
+        try:
+            await engine._queue.join()
+            assert engine._top_retry_count.get(MINT, 0) == 0
+            assert engine._top_retry_at[MINT] == now + 60
+            assert engine.tokens[MINT].facts.top10_share.detail == (
+                "Couldn't check right now (rate limited)"
+            )
+
+            now += 59
+            engine.schedule_retries()
+            assert engine._queue.empty()
+            now += 1
+            engine.schedule_retries()
+            assert engine._queue.qsize() == 1
+        finally:
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+
+    assert len(holder_requests) == 1

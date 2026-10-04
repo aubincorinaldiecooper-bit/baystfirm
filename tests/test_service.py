@@ -437,7 +437,7 @@ def test_solana_search_groups_sorts_and_caches_casefolded_queries(
     ]
     calls: list[tuple[str, str, dict[str, object] | None]] = []
 
-    async def get_json(source, url, *, params=None, headers=None):
+    async def get_json(source, url, *, params=None, headers=None, priority="background"):
         calls.append((source, url, params))
         return {"pairs": pairs}
 
@@ -479,7 +479,7 @@ def test_solana_search_groups_sorts_and_caches_casefolded_queries(
 
 
 def test_solana_search_upstream_error_returns_502(tmp_path: Path, monkeypatch) -> None:
-    async def get_json(source, url, *, params=None, headers=None):
+    async def get_json(source, url, *, params=None, headers=None, priority="background"):
         raise SourceError("dexscreener", "Couldn't check right now")
 
     app = _strategy_app(tmp_path, monkeypatch)
@@ -521,10 +521,10 @@ def test_solana_token_candles_map_intervals_cache_and_add_indicators(
             }
         }
     }
-    calls: list[tuple[str, str, dict[str, object] | None]] = []
+    calls: list[tuple[str, str, dict[str, object] | None, str]] = []
 
-    async def get_json(source, url, *, params=None, headers=None):
-        calls.append((source, url, params))
+    async def get_json(source, url, *, params=None, headers=None, priority="background"):
+        calls.append((source, url, params, priority))
         if source == "dexscreener":
             return pairs
         return candle_body
@@ -584,6 +584,7 @@ def test_solana_token_candles_map_intervals_cache_and_add_indicators(
         intervals.values()
     )
     hourly = next(call for call in gecko_calls if call[1].endswith("/ohlcv/hour"))
+    assert all(call[3] == "interactive" for call in gecko_calls)
     assert hourly[2] == {
         "aggregate": 1,
         "limit": 2,
@@ -601,7 +602,7 @@ def test_solana_token_candles_no_pool_and_validation_errors(
     with TestClient(app) as client:
         checker = app.state.runtime.solana_tokens.checker
 
-        async def empty_pairs(source, url, *, params=None, headers=None):
+        async def empty_pairs(source, url, *, params=None, headers=None, priority="background"):
             return []
 
         monkeypatch.setattr(checker, "get_json", empty_pairs)
@@ -642,7 +643,7 @@ def test_solana_token_candles_stale_cache_and_unavailable_response(
     }
     fail_gecko = False
 
-    async def get_json(source, url, *, params=None, headers=None):
+    async def get_json(source, url, *, params=None, headers=None, priority="background"):
         if source == "dexscreener":
             return pairs
         if fail_gecko:
@@ -672,7 +673,7 @@ def test_solana_token_candles_stale_cache_and_unavailable_response(
     with TestClient(other_app) as client:
         checker = other_app.state.runtime.solana_tokens.checker
 
-        async def unavailable(source, url, *, params=None, headers=None):
+        async def unavailable(source, url, *, params=None, headers=None, priority="background"):
             if source == "dexscreener":
                 return pairs
             raise SourceError("geckoterminal", "Couldn't check right now")

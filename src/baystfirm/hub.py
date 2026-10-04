@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from baystfirm.models import Classification, MarketEvent
 
@@ -24,16 +25,21 @@ class EventHub:
                 continue
             queue.put_nowait(item)
 
-    async def subscribe(self) -> AsyncIterator[StreamItem]:
+    @asynccontextmanager
+    async def open_queue(self) -> AsyncIterator[asyncio.Queue[StreamItem]]:
         queue: asyncio.Queue[StreamItem] = asyncio.Queue(self._queue_size)
         async with self._lock:
             self._subscribers.add(queue)
         try:
-            while True:
-                yield await queue.get()
+            yield queue
         finally:
             async with self._lock:
                 self._subscribers.discard(queue)
+
+    async def subscribe(self) -> AsyncIterator[StreamItem]:
+        async with self.open_queue() as queue:
+            while True:
+                yield await queue.get()
 
     @property
     def subscriber_count(self) -> int:

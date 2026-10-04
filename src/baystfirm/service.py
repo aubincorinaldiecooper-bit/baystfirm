@@ -1,12 +1,24 @@
 from __future__ import annotations
 
+import hmac
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+from fastapi.responses import StreamingResponse
 
 from baystfirm.classifiers import MarketStateClassifier
 from baystfirm.config import Settings
@@ -14,6 +26,7 @@ from baystfirm.evaluation import PromotionGate
 from baystfirm.hub import EventHub
 from baystfirm.ingestion import IngestionSupervisor
 from baystfirm.pipeline import IntelligencePipeline
+from baystfirm.sse import sse_frames
 from baystfirm.storage import EventStore
 
 
@@ -24,6 +37,13 @@ class Runtime:
     hub: EventHub
     pipeline: IntelligencePipeline
     ingestion: IngestionSupervisor
+
+
+def _authorized(expected: str | None, authorization: str | None) -> bool:
+    if expected is None:
+        return True
+    scheme, _, token = (authorization or "").partition(" ")
+    return scheme.lower() == "bearer" and hmac.compare_digest(token.strip(), expected)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -60,6 +80,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.runtime = runtime
 
+    async def require_api_key(authorization: str | None = Header(default=None)) -> None:
+        if not _authorized(runtime.settings.api_key, authorization):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="A valid bearer API key is required.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    v1 = APIRouter(prefix="/v1", dependencies=[Depends(require_api_key)])
+
     @app.get("/health")
     async def health() -> dict[str, object]:
         return {
@@ -79,7 +109,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
         }
 
-    @app.get("/v1/events")
+    @v1.get("/events")
     async def events(
         symbol: str | None = None,
         limit: int = Query(default=100, ge=1, le=10_000),
@@ -89,7 +119,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             async for event in runtime.store.iter_events(symbol=symbol, limit=limit)
         ]
 
-    @app.get("/v1/classifications")
+    @v1.get("/classifications")
     async def classifications(
         symbol: str | None = None,
         classifier: str | None = None,
@@ -104,7 +134,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         ]
 
-    @app.get("/v1/evaluation/gate")
+    @v1.get("/evaluation/gate")
     async def evaluation_gate() -> dict[str, object]:
         gate = PromotionGate()
         return {
@@ -122,8 +152,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
         }
 
+    @v1.get("/snapshot")
+    async def snapshot() -> dict[str, object]:
+        events = sorted(
+            runtime.pipeline.latest_events.values(),
+            key=lambda event: (event.symbol, event.venue),
+        )
+        classifications = sorted(
+            runtime.pipeline.latest_classifications.values(),
+            key=lambda item: (item.classifier, item.symbol),
+        )
+        return {
+            "generated_at": datetime.now(UTC).isoformat(),
+            "shadow_mode": runtime.settings.shadow_mode,
+            "enabled_venues": runtime.settings.enabled_venues,
+            "symbols": runtime.settings.symbols,
+            "latest_events": [event.model_dump(mode="json") for event in events],
+            "latest_classifications": [item.model_dump(mode="json") for item in classifications],
+        }
+
+    @v1.get("/stream/sse")
+    async def stream_sse(symbols: str | None = None) -> StreamingResponse:
+        wanted = [value.strip() for value in (symbols or "").split(",") if value.strip()]
+        return StreamingResponse(
+            sse_frames(runtime.hub, wanted),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+        )
+
+    app.include_router(v1)
+
     @app.websocket("/v1/stream")
     async def stream(websocket: WebSocket) -> None:
+        if not _authorized(runtime.settings.api_key, websocket.headers.get("authorization")):
+            await websocket.close(code=1008)
+            return
         await websocket.accept()
         try:
             async for item in runtime.hub.subscribe():

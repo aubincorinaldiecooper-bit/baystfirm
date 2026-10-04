@@ -5,6 +5,7 @@ import logging
 from collections.abc import Callable
 
 from baystfirm.adapters import (
+    BinanceUSAdapter,
     BybitLinearAdapter,
     BybitSpotAdapter,
     CoinbaseAdapter,
@@ -26,6 +27,7 @@ def build_adapters(settings: Settings) -> list[MarketAdapter]:
         "kraken": (KrakenAdapter,),
         "bybit": (BybitSpotAdapter, BybitLinearAdapter),
         "okx": (OkxSpotAdapter, OkxSwapAdapter),
+        "binanceus": (BinanceUSAdapter,),
     }
     adapters: list[MarketAdapter] = []
     for venue in settings.enabled_venues:

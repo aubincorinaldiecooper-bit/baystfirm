@@ -1,11 +1,12 @@
 import json
 from pathlib import Path
 
+from baystfirm.adapters.binanceus import BinanceUSAdapter
 from baystfirm.adapters.bybit import BybitLinearAdapter, BybitSpotAdapter
 from baystfirm.adapters.coinbase import CoinbaseAdapter
 from baystfirm.adapters.kraken import KrakenAdapter
 from baystfirm.adapters.okx import OkxSpotAdapter, OkxSwapAdapter
-from baystfirm.config import Settings
+from baystfirm.config import DEFAULT_VENUES, Settings
 from baystfirm.ingestion import build_adapters
 from baystfirm.models import EventType, InstrumentKind, Side
 
@@ -26,6 +27,20 @@ def test_okx_swap_adapter_is_registered() -> None:
     )
     adapters = build_adapters(settings)
     assert [type(adapter) for adapter in adapters] == [OkxSpotAdapter, OkxSwapAdapter]
+
+
+def test_binanceus_adapter_uses_only_verified_spot_symbols() -> None:
+    settings = Settings(
+        database_path=Path(":memory:"),
+        enabled_venues=("binanceus",),
+        shadow_mode=True,
+        symbols=("BTC-USDT", "BTC-USDT-PERP", "PYUSD-USD", "USDC-USDT"),
+    )
+    adapters = build_adapters(settings)
+    assert "binanceus" in DEFAULT_VENUES
+    assert len(adapters) == 1
+    assert isinstance(adapters[0], BinanceUSAdapter)
+    assert adapters[0].symbols == ("BTCUSDT", "USDCUSDT")
 
 
 def test_coinbase_trade_fixture_normalization() -> None:
@@ -120,6 +135,13 @@ def test_bybit_spot_stablecoin_normalization() -> None:
     assert events[0].instrument_kind is InstrumentKind.SPOT
 
 
+def test_bybit_orderbook_subscriptions_use_documented_maximum() -> None:
+    spot = BybitSpotAdapter(("BTC-USDT",))
+    linear = BybitLinearAdapter(("BTC-USDT-PERP",))
+    assert "orderbook.1000.BTCUSDT" in spot.subscription_messages()[0]["args"]
+    assert "orderbook.1000.BTCUSDT" in linear.subscription_messages()[0]["args"]
+
+
 def test_bybit_ticker_delta_merges_cached_snapshot() -> None:
     adapter = BybitLinearAdapter(("BTC-USDT-PERP",))
     snapshot, delta = fixture_messages("bybit_linear_tickers.json")
@@ -181,6 +203,7 @@ def test_bybit_orderbook_snapshot_delta_delete_and_reset() -> None:
 
 def test_kraken_book_fixture_snapshot_and_update() -> None:
     adapter = KrakenAdapter(("BTC-USD",))
+    assert adapter.subscription_messages()[1]["params"]["depth"] == 1000
     snapshot, update = fixture_messages("kraken_book.json")
     initial = adapter.parse_message(snapshot)[0]
     changed = adapter.parse_message(update)[0]
@@ -193,6 +216,44 @@ def test_kraken_book_fixture_snapshot_and_update() -> None:
     assert changed.event_type is EventType.BOOK
     assert 85344.4 not in book.bids
     assert 85339.1 in book.bids
+
+
+def test_binanceus_partial_depth_fixture_normalization() -> None:
+    adapter = BinanceUSAdapter(
+        (
+            "BTC-USDT",
+            "BTC-USD",
+            "SOL-USDT",
+            "BTC-USDT-PERP",
+            "PYUSD-USD",
+            "USDC-USDT",
+        )
+    )
+    assert adapter.symbols == ("BTCUSDT", "BTCUSD", "SOLUSDT", "USDCUSDT")
+    assert "btcusdt@trade" in adapter.connection_url()
+    assert "btcusdt@depth20@100ms" in adapter.connection_url()
+    assert "btcusdtperp" not in adapter.connection_url()
+    trade_raw = json.dumps(json.loads((FIXTURES / "binanceus_trade.json").read_text()))
+    trade = adapter.parse_message(trade_raw)[0]
+    assert trade.venue == "binanceus"
+    assert trade.symbol == "SOL-USDT"
+    assert trade.event_type is EventType.TRADE
+    assert trade.side is Side.BUY
+    assert trade.sequence == 11909392
+    assert trade.price == 121.47
+    assert trade.size == 0.272
+    assert trade.metadata["buyer_is_maker"] is False
+    raw = json.dumps(json.loads((FIXTURES / "binanceus_depth20.json").read_text()))
+    event = adapter.parse_message(raw)[0]
+    assert event.venue == "binanceus"
+    assert event.symbol == "BTC-USDT"
+    assert event.event_type is EventType.BOOK
+    assert event.depth_levels == 20
+    assert event.bid == 85330.76
+    assert event.ask == 85330.77
+    assert event.bid_depth_10bps is None
+    assert event.ask_depth_50bps is None
+    assert not hasattr(adapter, "_books")
 
 
 def test_okx_spot_normalization() -> None:

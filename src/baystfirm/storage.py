@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import aiosqlite
 
-from baystfirm.models import Classification, MarketEvent
+from baystfirm.models import Candle, Classification, MarketEvent
 
 
 class EventStore:
@@ -62,6 +62,23 @@ class EventStore:
                 classifier TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 payload TEXT NOT NULL
+            )
+            """
+        )
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS candles (
+                venue TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                interval TEXT NOT NULL,
+                open_time INTEGER NOT NULL,
+                open REAL NOT NULL,
+                high REAL NOT NULL,
+                low REAL NOT NULL,
+                close REAL NOT NULL,
+                volume REAL NOT NULL,
+                fetched_at TEXT NOT NULL,
+                PRIMARY KEY (venue, symbol, interval, open_time)
             )
             """
         )
@@ -196,6 +213,70 @@ class EventStore:
         row = await cursor.fetchone()
         await cursor.close()
         return int(row[0]) if row else 0
+
+    async def candles(
+        self, venue: str, symbol: str, interval: str, limit: int
+    ) -> tuple[list[Candle], datetime | None]:
+        cursor = await self.connection.execute(
+            """
+            SELECT open_time, open, high, low, close, volume, fetched_at
+            FROM candles
+            WHERE venue = ? AND symbol = ? AND interval = ?
+            ORDER BY open_time DESC
+            LIMIT ?
+            """,
+            (venue, symbol, interval, limit),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        candles = [
+            Candle(
+                open_time=int(row[0]),
+                open=float(row[1]),
+                high=float(row[2]),
+                low=float(row[3]),
+                close=float(row[4]),
+                volume=float(row[5]),
+            )
+            for row in rows
+        ]
+        fetched_at = max(datetime.fromisoformat(str(row[6])) for row in rows) if rows else None
+        return list(reversed(candles)), fetched_at
+
+    async def store_candles(
+        self,
+        venue: str,
+        symbol: str,
+        interval: str,
+        candles: Iterable[Candle],
+        fetched_at: datetime,
+    ) -> None:
+        values = [
+            (
+                venue,
+                symbol,
+                interval,
+                candle.open_time,
+                candle.open,
+                candle.high,
+                candle.low,
+                candle.close,
+                candle.volume,
+                fetched_at.isoformat(),
+            )
+            for candle in candles
+        ]
+        if not values:
+            return
+        await self.connection.executemany(
+            """
+            INSERT OR REPLACE INTO candles (
+                venue, symbol, interval, open_time, open, high, low, close, volume, fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+        await self.connection.commit()
 
     async def append_evaluation_run(self, classifier: str, payload: dict[str, Any]) -> str:
         run_id = str(uuid4())

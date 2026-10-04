@@ -26,6 +26,7 @@ def _datetime_ms_or_none(value: Any) -> datetime | None:
 class _BybitAdapter(MarketAdapter):
     name = "bybit"
     instrument_kind: InstrumentKind
+    orderbook_depth = 1000
 
     def subscription_messages(self) -> list[dict[str, Any]]:
         topics: list[str] = []
@@ -33,7 +34,7 @@ class _BybitAdapter(MarketAdapter):
             topics.append(f"publicTrade.{symbol}")
             if self.instrument_kind is InstrumentKind.PERPETUAL:
                 topics.extend((f"tickers.{symbol}", f"allLiquidation.{symbol}"))
-            topics.append(f"orderbook.50.{symbol}")
+            topics.append(f"orderbook.{self.orderbook_depth}.{symbol}")
         return [
             {"op": "subscribe", "args": topics[index : index + 10]}
             for index in range(0, len(topics), 10)
@@ -51,7 +52,7 @@ class _BybitAdapter(MarketAdapter):
             return self._parse_ticker(payload, raw)
         if topic.startswith("allLiquidation.") and self.instrument_kind is InstrumentKind.PERPETUAL:
             return self._parse_liquidations(payload, raw)
-        if topic.startswith("orderbook.50."):
+        if topic.startswith("orderbook."):
             return self._parse_orderbook(payload, raw)
         return []
 
@@ -200,7 +201,7 @@ class _BybitAdapter(MarketAdapter):
         if parts is None:
             return []
         base, quote = parts
-        book = self._books.setdefault(native_symbol, LocalOrderBook(depth=50))
+        book = self._books.setdefault(native_symbol, LocalOrderBook(depth=self.orderbook_depth))
         snapshot = payload.get("type") == "snapshot"
         book.update(
             ((float(price), float(size)) for price, size in data.get("b", [])),

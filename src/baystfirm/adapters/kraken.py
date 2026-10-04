@@ -42,7 +42,7 @@ class KrakenAdapter(MarketAdapter):
                 "params": {
                     "channel": "book",
                     "symbol": list(self.symbols),
-                    "depth": 25,
+                    "depth": 1000,
                     "snapshot": True,
                 },
             },
@@ -89,7 +89,7 @@ class KrakenAdapter(MarketAdapter):
         for item in payload.get("data", []):
             native_symbol = str(item["symbol"]).upper()
             base, quote = native_symbol.split("/", maxsplit=1)
-            book = self._books.setdefault(native_symbol, LocalOrderBook(depth=25))
+            book = self._books.setdefault(native_symbol, LocalOrderBook(depth=1000))
             book.update(
                 ((float(level["price"]), float(level["qty"])) for level in item.get("bids", [])),
                 ((float(level["price"]), float(level["qty"])) for level in item.get("asks", [])),

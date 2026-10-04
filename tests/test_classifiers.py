@@ -54,6 +54,8 @@ def test_stablecoin_quoted_pairs_are_converted_to_usd() -> None:
     evidence = {item.metric: item.value for item in result.evidence}
     assert evidence["quote_converted_observations"] == 1
     assert evidence["cross_venue_median_usd_price"] == 0.995
+
+
 def test_momentum_survives_more_than_500_trades_in_30_seconds() -> None:
     classifier = MarketStateClassifier()
     start = datetime(2025, 1, 1, tzinfo=UTC)

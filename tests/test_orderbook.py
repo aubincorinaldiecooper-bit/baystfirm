@@ -7,8 +7,11 @@ from baystfirm.models import EventType, InstrumentKind, MarketEvent, payload_dig
 
 
 def test_depth_within_sums_quote_notional_inside_bps_band() -> None:
-    levels = [(99.9, 2.0), (99.8, 1.0), (100.05, 3.0)]
-    assert abs(depth_within(levels, 100.0, 10) - 499.95) < 1e-9
+    levels = [(99.9, 2.0), (99.8, 1.0), (100.05, 3.0), (99.0, 1.0)]
+    depth = depth_within(levels, 100.0, 10)
+    assert depth is not None
+    assert abs(depth - 499.95) < 1e-9
+    assert depth_within([(99.95, 2.0), (100.05, 3.0)], 100.0, 10) is None
 
 
 def test_local_order_book_applies_updates_deletions_and_snapshots() -> None:

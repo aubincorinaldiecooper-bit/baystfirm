@@ -1,56 +1,21 @@
 [
   {
-    "channel": "ticker",
-    "timestamp": "2026-10-04T17:35:49.153465466Z",
-    "sequence_num": 0,
-    "events": [
-      {
-        "type": "snapshot",
-        "tickers": [
-          {
-            "type": "ticker",
-            "product_id": "BTC-USD",
-            "price": "85359.78",
-            "volume_24_h": "1745.57927294",
-            "low_24_h": "84537.72",
-            "high_24_h": "85468.43",
-            "low_52_w": "57717.55",
-            "high_52_w": "126296",
-            "price_percent_chg_24_h": "0.56669052029259",
-            "best_bid": "85359.78",
-            "best_ask": "85359.79",
-            "best_bid_quantity": "0.07718108",
-            "best_ask_quantity": "0.13195545"
-          }
-        ]
-      }
-    ]
-  },
-  {
-    "channel": "ticker",
-    "timestamp": "2026-10-04T17:35:49.288721436Z",
-    "sequence_num": 3,
-    "events": [
-      {
-        "type": "update",
-        "tickers": [
-          {
-            "type": "ticker",
-            "product_id": "BTC-USD",
-            "price": "85359.78",
-            "volume_24_h": "1745.57927294",
-            "low_24_h": "84537.72",
-            "high_24_h": "85468.43",
-            "low_52_w": "57717.55",
-            "high_52_w": "126296",
-            "price_percent_chg_24_h": "0.56669052029259",
-            "best_bid": "85359.78",
-            "best_ask": "85359.79",
-            "best_bid_quantity": "0.07718082",
-            "best_ask_quantity": "0.13195545"
-          }
-        ]
-      }
-    ]
+    "type": "ticker",
+    "sequence": 137234409912,
+    "product_id": "BTC-USD",
+    "price": "85325",
+    "open_24h": "84990.98",
+    "volume_24h": "1721.89601646",
+    "low_24h": "84537.72",
+    "high_24h": "85468.43",
+    "volume_30d": "170760.36648858",
+    "best_bid": "85324.99",
+    "best_bid_size": "1.08296808",
+    "best_ask": "85325.00",
+    "best_ask_size": "0.01692372",
+    "side": "buy",
+    "time": "2026-10-04T17:56:31.854081Z",
+    "trade_id": 1102238918,
+    "last_size": "0.00058919"
   }
 ]

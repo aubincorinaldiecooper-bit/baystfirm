@@ -1,0 +1,14 @@
+[
+  {
+    "type": "match",
+    "trade_id": 1102238919,
+    "maker_order_id": "d9520aba-e6e1-4c14-b146-b12d3d2dc679",
+    "taker_order_id": "a8422014-593d-4202-84a4-15d5006bfff0",
+    "side": "buy",
+    "size": "0.00000005",
+    "price": "85324.99",
+    "product_id": "BTC-USD",
+    "sequence": 137234410134,
+    "time": "2026-10-04T17:56:32.991111Z"
+  }
+]

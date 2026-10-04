@@ -213,8 +213,6 @@ class _BybitAdapter(MarketAdapter):
         best_ask = asks[0] if asks else None
         mid = (best_bid[0] + best_ask[0]) / 2 if best_bid and best_ask else 0.0
         depth_levels = min(len(bids), len(asks))
-        depth_bids = bids[:depth_levels]
-        depth_asks = asks[:depth_levels]
         return [
             MarketEvent(
                 venue=self.name,
@@ -231,10 +229,10 @@ class _BybitAdapter(MarketAdapter):
                 ask=best_ask[0] if best_ask else None,
                 bid_size=best_bid[1] if best_bid else None,
                 ask_size=best_ask[1] if best_ask else None,
-                bid_depth_10bps=depth_within(depth_bids, mid, 10) if mid else None,
-                ask_depth_10bps=depth_within(depth_asks, mid, 10) if mid else None,
-                bid_depth_50bps=depth_within(depth_bids, mid, 50) if mid else None,
-                ask_depth_50bps=depth_within(depth_asks, mid, 50) if mid else None,
+                bid_depth_10bps=depth_within(bids, mid, 10) if mid else None,
+                ask_depth_10bps=depth_within(asks, mid, 10) if mid else None,
+                bid_depth_50bps=depth_within(bids, mid, 50) if mid else None,
+                ask_depth_50bps=depth_within(asks, mid, 50) if mid else None,
                 depth_levels=depth_levels,
                 payload_hash=payload_digest(raw),
                 metadata={

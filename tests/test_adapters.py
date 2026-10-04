@@ -28,19 +28,32 @@ def test_okx_swap_adapter_is_registered() -> None:
     assert [type(adapter) for adapter in adapters] == [OkxSpotAdapter, OkxSwapAdapter]
 
 
+def test_coinbase_trade_fixture_normalization() -> None:
+    adapter = CoinbaseAdapter(("BTC-USD",))
+    assert adapter.subscription_messages() == [
+        {"type": "subscribe", "product_ids": ["BTC-USD"], "channels": ["matches"]},
+        {"type": "subscribe", "product_ids": ["BTC-USD"], "channels": ["ticker"]},
+    ]
+    event = adapter.parse_message(fixture_messages("coinbase_matches.json")[0])[0]
+    assert event.event_type is EventType.TRADE
+    assert event.symbol == "BTC-USD"
+    assert event.sequence == 137234410134
+    assert event.metadata["trade_id"] == 1102238919
+    assert event.price == 85324.99
+    assert event.size == 0.00000005
+    assert event.side is Side.BUY
+
+
 def test_coinbase_ticker_fixture_normalization() -> None:
     adapter = CoinbaseAdapter(("BTC-USD",))
-    events = [
-        event
-        for raw in fixture_messages("coinbase_ticker.json")
-        for event in adapter.parse_message(raw)
-    ]
-    assert len(events) == 2
-    assert all(event.event_type is EventType.QUOTE for event in events)
-    assert events[0].symbol == "BTC-USD"
-    assert events[0].bid == 85359.78
-    assert events[0].ask == 85359.79
-    assert events[0].bid_size == 0.07718108
+    event = adapter.parse_message(fixture_messages("coinbase_ticker.json")[0])[0]
+    assert event.event_type is EventType.QUOTE
+    assert event.symbol == "BTC-USD"
+    assert event.sequence == 137234409912
+    assert event.bid == 85324.99
+    assert event.ask == 85325.0
+    assert event.bid_size == 1.08296808
+    assert event.ask_size == 0.01692372
 
 
 def test_kraken_trade_normalization() -> None:
@@ -132,6 +145,10 @@ def test_bybit_orderbook_snapshot_delta_delete_and_reset() -> None:
     updated = linear.parse_message(linear_delta)[0]
     assert initial.event_type is EventType.BOOK
     assert initial.depth_levels == 50
+    assert initial.bid_depth_10bps is None
+    assert initial.ask_depth_10bps is None
+    assert initial.bid_depth_50bps is None
+    assert initial.ask_depth_50bps is None
     assert 85322.1 in linear._books["BTCUSDT"].bids
     assert updated.bid == initial.bid
 
@@ -169,6 +186,10 @@ def test_kraken_book_fixture_snapshot_and_update() -> None:
     changed = adapter.parse_message(update)[0]
     book = adapter._books["BTC/USD"]
     assert initial.depth_levels == 25
+    assert initial.bid_depth_10bps is None
+    assert initial.ask_depth_10bps is None
+    assert initial.bid_depth_50bps is None
+    assert initial.ask_depth_50bps is None
     assert changed.event_type is EventType.BOOK
     assert 85344.4 not in book.bids
     assert 85339.1 in book.bids
@@ -200,18 +221,40 @@ def test_okx_spot_normalization() -> None:
     assert events[0].side is Side.SELL
 
 
-def test_okx_books5_spot_fixture() -> None:
+def test_okx_books_spot_snapshot_update_delete_and_reset() -> None:
     adapter = OkxSpotAdapter(("BTC-USDT",))
-    event = adapter.parse_message(fixture_messages("okx_books5_spot.json")[0])[0]
-    assert event.event_type is EventType.BOOK
-    assert event.symbol == "BTC-USDT"
-    assert event.depth_levels == 5
-    assert event.bid == 85368.5
-    assert event.ask == 85368.6
+    subscription = adapter.subscription_messages()[0]["args"]
+    assert {"channel": "books", "instId": "BTC-USDT"} in subscription
+    assert not any(argument["channel"] == "books5" for argument in subscription)
+    snapshot, update = fixture_messages("okx_books_spot.json")
+    initial = adapter.parse_message(snapshot)[0]
+    changed = adapter.parse_message(update)[0]
+    book = adapter._books["BTC-USDT"]
+    assert initial.event_type is EventType.BOOK
+    assert initial.depth_levels == 400
+    assert initial.bid == 85325.2
+    assert initial.ask is not None
+    assert initial.bid_depth_10bps is not None
+    assert initial.ask_depth_10bps is not None
+    assert initial.bid_depth_50bps is None
+    assert initial.ask_depth_50bps is None
+    assert changed.depth_levels == 400
+    assert 85313.1 not in book.bids
+    assert 85497.6 not in book.asks
+
+    reset = json.loads(snapshot)
+    reset["data"][0]["bids"] = reset["data"][0]["bids"][:1]
+    reset["data"][0]["asks"] = reset["data"][0]["asks"][:1]
+    reset["data"][0]["ts"] = str(int(reset["data"][0]["ts"]) + 100)
+    adapter.parse_message(json.dumps(reset))
+    assert len(book.bids) == len(book.asks) == 1
 
 
 def test_okx_swap_fixtures_normalize_derivatives_and_books() -> None:
     adapter = OkxSwapAdapter(("BTC-USDT-PERP",))
+    subscription = adapter.subscription_messages()[0]["args"]
+    assert {"channel": "books", "instId": "BTC-USDT-SWAP"} in subscription
+    assert not any(argument["channel"] == "books5" for argument in subscription)
     funding = adapter.parse_message(fixture_messages("okx_funding_rate.json")[0])[0]
     mark = adapter.parse_message(fixture_messages("okx_mark_price.json")[0])[0]
     index = adapter.parse_message(fixture_messages("okx_index_tickers.json")[0])[0]
@@ -223,8 +266,9 @@ def test_okx_swap_fixtures_normalize_derivatives_and_books() -> None:
     assert index.funding_rate == funding.funding_rate
     assert index.mark_price == mark.mark_price
 
-    book_frame = fixture_messages("okx_books5_swap.json")[0]
-    assert adapter.parse_message(book_frame) == []
+    book_snapshot, book_update = fixture_messages("okx_books_swap.json")
+    assert adapter.parse_message(book_snapshot) == []
+    assert adapter.parse_message(book_update) == []
     oi_events = adapter.parse_message(fixture_messages("okx_open_interest.json")[0])
     open_interest = next(
         event for event in oi_events if event.event_type is EventType.OPEN_INTEREST
@@ -232,11 +276,13 @@ def test_okx_swap_fixtures_normalize_derivatives_and_books() -> None:
     book = next(event for event in oi_events if event.event_type is EventType.BOOK)
     assert open_interest.open_interest == 2854317.50000000943
     assert open_interest.open_interest_value == 2435429280.97000804609092
-    assert book.depth_levels == 5
-    assert book.bid_size == 1075.62
+    assert book.depth_levels == 400
+    assert book.bid_size == 5.39
     assert book.metadata["contract_multiplier"] == 0.01
-    assert book.bid_depth_10bps is not None
-    assert book.bid_depth_10bps >= book.bid * book.bid_size * 0.01
+    assert book.bid_depth_10bps is None
+    assert book.ask_depth_10bps is None
+    assert book.bid_depth_50bps is None
+    assert book.ask_depth_50bps is None
 
 
 def test_okx_liquidation_fixture_filters_global_channel_by_subscription() -> None:

@@ -7,11 +7,17 @@ BookSide = Literal["bids", "asks"]
 Level = tuple[float, float]
 
 
-def depth_within(levels: Iterable[Level], mid: float, bps: float) -> float:
-    if mid <= 0 or bps < 0:
-        return 0.0
+def depth_within(levels: Iterable[Level], mid: float, bps: float) -> float | None:
+    levels = list(levels)
+    if not levels or mid <= 0 or bps < 0:
+        return None
+    distances = [abs(price - mid) * 10_000 / mid for price, _ in levels]
+    if max(distances) < bps - 1e-9:
+        return None
     return sum(
-        price * size for price, size in levels if abs(price - mid) * 10_000 / mid <= bps + 1e-9
+        price * size
+        for (price, size), distance in zip(levels, distances, strict=True)
+        if distance <= bps + 1e-9
     )
 
 

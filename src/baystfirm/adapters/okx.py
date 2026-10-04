@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from baystfirm.adapters.base import STABLE_QUOTES, MarketAdapter, split_symbol
-from baystfirm.adapters.orderbook import depth_within
+from baystfirm.adapters.orderbook import LocalOrderBook, depth_within
 from baystfirm.models import (
     EventType,
     InstrumentKind,
@@ -55,12 +55,13 @@ class OkxSpotAdapter(MarketAdapter):
             if quote in STABLE_QUOTES:
                 supported.append(symbol)
         super().__init__(tuple(supported))
+        self._books: dict[str, LocalOrderBook] = {}
 
     def subscription_messages(self) -> list[dict[str, Any]]:
         args = [
             {"channel": channel, "instId": symbol}
             for symbol in self.symbols
-            for channel in ("trades", "books5")
+            for channel in ("trades", "books")
         ]
         return [
             {"op": "subscribe", "args": args[index : index + 20]}
@@ -75,9 +76,9 @@ class OkxSpotAdapter(MarketAdapter):
         digest = payload_digest(raw)
         if channel == "trades":
             return self._parse_trades(payload, digest)
-        if channel == "books5":
+        if channel == "books":
             symbols = {symbol: symbol for symbol in self.symbols}
-            return _parse_books(payload, digest, InstrumentKind.SPOT, symbols)
+            return _parse_books(payload, digest, InstrumentKind.SPOT, symbols, self._books)
         return []
 
     def _parse_trades(self, payload: dict[str, Any], digest: str) -> list[MarketEvent]:
@@ -126,16 +127,17 @@ class OkxSwapAdapter(MarketAdapter):
         self._native_to_canonical = {
             symbol.removesuffix("-PERP") + "-SWAP": symbol for symbol in self.symbols
         }
+        self._books: dict[str, LocalOrderBook] = {}
         self._derivative_state: dict[str, dict[str, Any]] = {}
         self._contract_multipliers: dict[str, float] = {}
-        self._pending_books: dict[str, tuple[dict[str, Any], str]] = {}
+        self._pending_books: dict[str, tuple[dict[str, Any], str, str | None]] = {}
 
     def subscription_messages(self) -> list[dict[str, Any]]:
         args: list[dict[str, str]] = []
         for native_symbol in self._native_to_canonical:
             args.extend(
                 {"channel": channel, "instId": native_symbol}
-                for channel in ("trades", "funding-rate", "open-interest", "mark-price", "books5")
+                for channel in ("trades", "funding-rate", "open-interest", "mark-price", "books")
             )
             index_symbol = native_symbol.removesuffix("-SWAP")
             args.append({"channel": "index-tickers", "instId": index_symbol})
@@ -158,7 +160,7 @@ class OkxSwapAdapter(MarketAdapter):
             return self._parse_derivative_prices(payload, digest, channel)
         if channel == "open-interest":
             return self._parse_open_interest(payload, digest)
-        if channel == "books5":
+        if channel == "books":
             return self._parse_books(payload, digest)
         if channel == "liquidation-orders":
             return self._parse_liquidations(payload, digest)
@@ -167,20 +169,40 @@ class OkxSwapAdapter(MarketAdapter):
     def _parse_books(self, payload: dict[str, Any], digest: str) -> list[MarketEvent]:
         events: list[MarketEvent] = []
         for item in _items(payload.get("data")):
-            native_symbol = str(item["instId"]).upper()
+            native_symbol = str(item.get("instId") or payload.get("arg", {}).get("instId")).upper()
             symbol = self._native_to_canonical.get(native_symbol)
             multiplier = self._contract_multipliers.get(native_symbol)
             if symbol is None:
                 continue
+            item_payload = {
+                "action": payload.get("action"),
+                "arg": {"instId": native_symbol},
+                "data": [item],
+            }
             if multiplier is None:
-                self._pending_books[native_symbol] = (item, digest)
+                self._pending_books[native_symbol] = (
+                    item,
+                    digest,
+                    payload.get("action"),
+                )
+                events.extend(
+                    _parse_books(
+                        item_payload,
+                        digest,
+                        InstrumentKind.PERPETUAL,
+                        {native_symbol: symbol},
+                        self._books,
+                        emit=False,
+                    )
+                )
                 continue
             events.extend(
                 _parse_books(
-                    {"data": [item]},
+                    item_payload,
                     digest,
                     InstrumentKind.PERPETUAL,
                     {native_symbol: symbol},
+                    self._books,
                     size_multiplier=multiplier,
                 )
             )
@@ -298,13 +320,18 @@ class OkxSwapAdapter(MarketAdapter):
             )
             pending = self._pending_books.pop(native_symbol, None)
             if pending is not None and multiplier is not None:
-                book_item, book_digest = pending
+                book_item, book_digest, action = pending
                 events.extend(
                     _parse_books(
-                        {"data": [book_item]},
+                        {
+                            "action": action,
+                            "arg": {"instId": native_symbol},
+                            "data": [book_item],
+                        },
                         book_digest,
                         InstrumentKind.PERPETUAL,
                         {native_symbol: symbol},
+                        self._books,
                         size_multiplier=multiplier,
                     )
                 )
@@ -352,18 +379,28 @@ def _parse_books(
     digest: str,
     instrument_kind: InstrumentKind,
     symbols: Mapping[str, str],
+    books: dict[str, LocalOrderBook],
     *,
     size_multiplier: float = 1.0,
+    emit: bool = True,
 ) -> list[MarketEvent]:
     events: list[MarketEvent] = []
     for item in _items(payload.get("data")):
-        native_symbol = str(item["instId"]).upper()
+        native_symbol = str(item.get("instId") or payload.get("arg", {}).get("instId")).upper()
         symbol = symbols.get(native_symbol)
         if symbol is None:
             continue
         base, quote = split_symbol(symbol.removesuffix("-PERP"))
-        bids = _book_levels(item.get("bids"))
-        asks = _book_levels(item.get("asks"))
+        book = books.setdefault(native_symbol, LocalOrderBook(depth=400))
+        book.update(
+            _book_levels(item.get("bids")),
+            _book_levels(item.get("asks")),
+            snapshot=payload.get("action") == "snapshot",
+        )
+        if not emit:
+            continue
+        bids = book.top_n("bids")
+        asks = book.top_n("asks")
         best_bid = bids[0] if bids else None
         best_ask = asks[0] if asks else None
         mid = (best_bid[0] + best_ask[0]) / 2 if best_bid and best_ask else 0.0
@@ -389,10 +426,10 @@ def _parse_books(
                 ask_depth_10bps=depth_within(ask_depth_levels, mid, 10) if mid else None,
                 bid_depth_50bps=depth_within(bid_depth_levels, mid, 50) if mid else None,
                 ask_depth_50bps=depth_within(ask_depth_levels, mid, 50) if mid else None,
-                depth_levels=5,
+                depth_levels=min(len(bids), len(asks)),
                 payload_hash=digest,
                 metadata={
-                    "source_channel": "books5",
+                    "source_channel": "books",
                     "sequence_id": item.get("seqId"),
                     "size_unit": "contracts"
                     if instrument_kind is InstrumentKind.PERPETUAL

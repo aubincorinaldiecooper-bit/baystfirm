@@ -52,9 +52,29 @@ class MarketEvent(BaseModel):
     sequence: int | str | None = None
     price: float | None = None
     size: float | None = None
-    side: Side = Side.UNKNOWN
+    side: Side = Field(
+        default=Side.UNKNOWN,
+        description=(
+            "For Bybit liquidations this is the position side (BUY means a long was liquidated; "
+            "SELL means a short). For OKX it is the liquidation order side; the position side is "
+            "preserved in metadata."
+        ),
+    )
     bid: float | None = None
     ask: float | None = None
+    funding_rate: float | None = None
+    next_funding_at: datetime | None = None
+    open_interest: float | None = None
+    open_interest_value: float | None = None
+    mark_price: float | None = None
+    index_price: float | None = None
+    bid_size: float | None = None
+    ask_size: float | None = None
+    bid_depth_10bps: float | None = None
+    ask_depth_10bps: float | None = None
+    bid_depth_50bps: float | None = None
+    ask_depth_50bps: float | None = None
+    depth_levels: int | None = None
     payload_hash: str
     metadata: dict[str, Any] = Field(default_factory=dict)
 

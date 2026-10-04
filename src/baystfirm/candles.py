@@ -149,6 +149,22 @@ def source_interval(venue: str, interval: str) -> str:
     return max(divisors, key=INTERVAL_SECONDS.__getitem__)
 
 
+def validate_candle_request(
+    settings: Settings, venue: str, symbol: str, interval: str
+) -> tuple[str, str]:
+    venue = venue.lower()
+    symbol = symbol.upper()
+    if venue not in NATIVE_INTERVALS or venue not in settings.enabled_venues:
+        raise CandleNotFound("Unknown venue.")
+    if symbol not in settings.symbols:
+        raise CandleNotFound("Unknown symbol.")
+    if symbol.endswith("-PERP") and venue not in PERPETUAL_VENUES:
+        raise CandleNotFound("This venue does not provide perpetual candles.")
+    if interval not in CANDLE_INTERVALS:
+        raise CandleNotFound("Unsupported candle interval.")
+    return venue, symbol
+
+
 def bucket_open_time(open_time: int, interval: str) -> int:
     if interval == "1w":
         return WEEK_ORIGIN_MS + ((open_time - WEEK_ORIGIN_MS) // 604_800_000) * 604_800_000
@@ -524,16 +540,7 @@ class CandleService:
         self.client_factory = client_factory
 
     async def get(self, venue: str, symbol: str, interval: str, limit: int) -> dict[str, Any]:
-        venue = venue.lower()
-        symbol = symbol.upper()
-        if venue not in NATIVE_INTERVALS or venue not in self.settings.enabled_venues:
-            raise CandleNotFound("Unknown venue.")
-        if symbol not in self.settings.symbols:
-            raise CandleNotFound("Unknown symbol.")
-        if symbol.endswith("-PERP") and venue not in PERPETUAL_VENUES:
-            raise CandleNotFound("This venue does not provide perpetual candles.")
-        if interval not in CANDLE_INTERVALS:
-            raise CandleNotFound("Unsupported candle interval.")
+        venue, symbol = validate_candle_request(self.settings, venue, symbol, interval)
         if not 1 <= limit <= MAX_LIMIT:
             raise CandleNotFound(f"Limit must be between 1 and {MAX_LIMIT}.")
 

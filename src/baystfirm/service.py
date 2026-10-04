@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
+import math
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from time import monotonic
+from typing import Annotated, Any
 
 import httpx
 from fastapi import (
@@ -24,28 +26,35 @@ from fastapi import (
 from fastapi.responses import StreamingResponse
 
 from baystfirm.candles import (
+    INTERVAL_SECONDS,
     NATIVE_INTERVALS,
     PERPETUAL_VENUES,
     CandleNotFound,
     CandleService,
     CandleUnavailable,
+    aggregate_candles,
     fetch_source_candles,
+    source_interval,
+    validate_candle_request,
 )
 from baystfirm.classifiers import STABLECOINS, MarketStateClassifier
 from baystfirm.config import Settings
 from baystfirm.evaluation import PromotionGate
 from baystfirm.hub import EventHub
+from baystfirm.indicators import IndicatorSpec, compute_indicator, parse_indicator
 from baystfirm.ingestion import IngestionSupervisor
 from baystfirm.models import Candle
 from baystfirm.pipeline import IntelligencePipeline
 from baystfirm.regime import MomentumRegimeClassifier
 from baystfirm.sse import sse_frames
 from baystfirm.storage import EventStore
+from baystfirm.strategies import BacktestRequest, backtest
 from baystfirm.track_record import TrackRecordService
 
 logger = logging.getLogger(__name__)
 SEED_VENUE_ORDER = ("coinbase", "kraken", "okx", "binanceus", "bybit")
 SEED_BAR_COUNT = 1500
+BACKTEST_CACHE_TTL_SECONDS = 60.0
 
 
 SourceCandleFetcher = Callable[[httpx.AsyncClient, str, str, str, int], Awaitable[list[Candle]]]
@@ -60,6 +69,9 @@ class Runtime:
     ingestion: IngestionSupervisor
     momentum_classifier: MomentumRegimeClassifier
     track_record: TrackRecordService
+    backtest_candles: dict[tuple[str, str, str, int], tuple[float, list[Candle]]] = field(
+        default_factory=dict
+    )
     seed_task: asyncio.Task[None] | None = None
 
 
@@ -137,15 +149,91 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         symbol: str,
         interval: str = Query(pattern="^(1m|3m|5m|15m|30m|1h|2h|4h|6h|12h|1d|1w)$"),
         limit: int = Query(default=300, ge=1, le=500),
+        indicator: Annotated[list[str] | None, Query()] = None,
     ) -> dict[str, Any]:
+        specs: list[IndicatorSpec] = []
+        if indicator is not None:
+            if len(indicator) > 6:
+                raise HTTPException(
+                    status_code=422,
+                    detail="At most 6 indicator specs may be requested.",
+                )
+            try:
+                specs = [parse_indicator(value) for value in indicator]
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
         try:
-            return await CandleService(runtime.settings, runtime.store).get(
+            result = await CandleService(runtime.settings, runtime.store).get(
                 venue, symbol, interval, limit
             )
         except CandleNotFound as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         except CandleUnavailable as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
+        if specs:
+            closed_candles = [Candle.model_validate(item) for item in result["candles"]]
+            result["indicators"] = {
+                spec.key: compute_indicator(spec, closed_candles) for spec in specs
+            }
+        return result
+
+    @v1.post("/backtest")
+    async def run_backtest(request: BacktestRequest) -> dict[str, Any]:
+        rule = request.rule
+        try:
+            venue, symbol = validate_candle_request(
+                runtime.settings,
+                rule.venue,
+                rule.symbol,
+                rule.interval,
+            )
+        except CandleNotFound as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+        cache_key = (venue, symbol, rule.interval, request.bars)
+        cache_entry = runtime.backtest_candles.get(cache_key)
+        if cache_entry is not None and monotonic() - cache_entry[0] < BACKTEST_CACHE_TTL_SECONDS:
+            candles = cache_entry[1]
+        else:
+            try:
+                source_name = source_interval(venue, rule.interval)
+                source_seconds = INTERVAL_SECONDS[source_name]
+                target_seconds = INTERVAL_SECONDS[rule.interval]
+                source_limit = math.ceil(request.bars * target_seconds / source_seconds)
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    source_candles = await fetch_source_candles(
+                        client,
+                        venue,
+                        symbol,
+                        source_name,
+                        source_limit,
+                    )
+                unique = {candle.open_time: candle for candle in source_candles}
+                normalized = sorted(unique.values(), key=lambda candle: candle.open_time)
+                now_ms = int(datetime.now(UTC).timestamp() * 1000)
+                fetched = (
+                    aggregate_candles(
+                        normalized,
+                        source_name,
+                        rule.interval,
+                        now_ms=now_ms,
+                    )
+                    if source_name != rule.interval
+                    else normalized
+                )
+                interval_ms = target_seconds * 1000
+                candles = [
+                    candle for candle in fetched if candle.open_time + interval_ms <= now_ms
+                ][-request.bars :]
+            except Exception as error:
+                raise HTTPException(status_code=502, detail=str(error)) from error
+            runtime.backtest_candles[cache_key] = (monotonic(), candles)
+
+        result = await asyncio.to_thread(backtest, rule, candles, request.fee_bps)
+        response = result.model_dump(mode="json")
+        response["bars_requested"] = request.bars
+        response["truncated"] = len(candles) < request.bars
+        return response
 
     @app.get("/health")
     async def health() -> dict[str, object]:

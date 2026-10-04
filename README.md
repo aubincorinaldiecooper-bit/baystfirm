@@ -69,6 +69,40 @@ archive. Chart-state predictions use `gnsis_chart_momentum` and are graded again
 `short_horizon_momentum` outcomes; all learned outputs remain shadow and uncalibrated until
 validated.
 
+## Indicators and strategy backtests
+
+Request up to six talipp indicators with repeated `indicator` parameters. Indicator arrays align with
+the returned candles; `null` values at the beginning are expected during warm-up:
+
+```text
+/v1/candles?venue=coinbase&symbol=BTC-USD&interval=1h&indicator=sma%3A20&indicator=rsi%3A14
+```
+
+`POST /v1/backtest` evaluates a rule against historical closed candles. It is a deterministic,
+intelligence-only simulation and does not execute trades:
+
+```json
+{
+  "rule": {
+    "name": "Example rule",
+    "venue": "coinbase",
+    "symbol": "BTC-USD",
+    "interval": "1h",
+    "conditions": [
+      {
+        "left": {"kind": "price", "field": "close"},
+        "op": "above",
+        "right": {"kind": "indicator", "spec": "sma:20"}
+      }
+    ],
+    "expect": "up",
+    "exit": {"after_bars": 24}
+  },
+  "bars": 1000,
+  "fee_bps": 10
+}
+```
+
 ## Configuration
 
 | Variable | Default | Purpose |

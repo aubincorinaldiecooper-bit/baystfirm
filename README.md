@@ -4,8 +4,7 @@ Baystfirm is the backend foundation for a crypto-native realtime intelligence te
 normalizes public market streams, preserves event provenance, replays historical observations, and
 evaluates bounded market-state classifiers before they are allowed to surface as trusted signals.
 
-The first release is intelligence-only. It does not connect wallets, execute trades, or label an
-asset as a universally good or bad investment.
+The first release is intelligence-only. It does not connect wallets or execute trades.
 
 ## Product contract
 
@@ -53,6 +52,22 @@ Evaluate externally labeled newline-delimited prediction records:
 ```bash
 .venv/bin/baystfirm evaluate evaluation-records.jsonl
 ```
+
+The promotion gate also requires at least 0.5 macro recall across labels present in the expected outcomes; abstentions count as misses.
+
+Import official Binance spot aggregate trades into the event database, timestamped CSV ticks, or
+both. Repeat `--date` for each UTC archive day; at least one output is required:
+
+```bash
+.venv/bin/baystfirm import-archive --symbol BTCUSDT \
+  --date 2025-09-01 --date 2025-09-02 \
+  --database var/baystfirm.db --ticks-dir var/ticks
+```
+
+The importer verifies Binance's published SHA-256 checksum before reading each cached or downloaded
+archive. Chart-state predictions use `gnsis_chart_momentum` and are graded against realized
+`short_horizon_momentum` outcomes; all learned outputs remain shadow and uncalibrated until
+validated.
 
 ## Configuration
 

@@ -145,6 +145,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "minimum_samples": gate.minimum_samples,
                 "minimum_coverage": gate.minimum_coverage,
                 "minimum_accuracy": gate.minimum_accuracy,
+                "minimum_macro_recall": gate.minimum_macro_recall,
                 "maximum_false_alert_rate": gate.maximum_false_alert_rate,
                 "maximum_brier_score": gate.maximum_brier_score,
                 "maximum_expected_calibration_error": gate.maximum_ece,

@@ -48,6 +48,9 @@ def test_api_key_guards_v1_routes(tmp_path: Path) -> None:
         assert client.get("/v1/snapshot").status_code == 401
         assert client.get("/v1/track-record").status_code == 401
         assert client.post("/v1/backtest", json=_backtest_body()).status_code == 401
+        batch_body = _backtest_body()
+        batch_body["also"] = [{"venue": "coinbase", "symbol": "ETH-USD"}]
+        assert client.post("/v1/backtest/batch", json=batch_body).status_code == 401
         wrong = client.get("/v1/snapshot", headers={"Authorization": "Bearer nope"})
         assert wrong.status_code == 401
         ok = client.get("/v1/snapshot", headers={"Authorization": "Bearer secret"})
@@ -95,6 +98,21 @@ async def _no_background_work(*args: object, **kwargs: object) -> None:
 
 def _strategy_app(tmp_path: Path, monkeypatch) -> object:
     app = create_app(_strategy_settings(tmp_path))
+    monkeypatch.setattr(service_module, "_seed_minute_bars", _no_background_work)
+    monkeypatch.setattr(app.state.runtime.ingestion, "start", _no_background_work)
+    monkeypatch.setattr(app.state.runtime.ingestion, "stop", _no_background_work)
+    return app
+
+
+def _batch_strategy_app(tmp_path: Path, monkeypatch) -> object:
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "batch-strategies.db",
+            enabled_venues=("coinbase",),
+            shadow_mode=True,
+            symbols=("BTC-USD", "ETH-USD"),
+        )
+    )
     monkeypatch.setattr(service_module, "_seed_minute_bars", _no_background_work)
     monkeypatch.setattr(app.state.runtime.ingestion, "start", _no_background_work)
     monkeypatch.setattr(app.state.runtime.ingestion, "stop", _no_background_work)
@@ -287,6 +305,119 @@ def test_backtest_cache_prunes_expired_entries_and_evicts_oldest(
         assert fresh_keys[2] in runtime.backtest_candles
         assert ("coinbase", "BTC-USD", "1m", 100) in runtime.backtest_candles
         assert len(runtime.backtest_candles) == service_module.BACKTEST_CACHE_MAX_ENTRIES
+
+
+def test_batch_backtest_keeps_request_order_reports_unknown_symbols_and_reuses_cache(
+    tmp_path: Path, monkeypatch
+) -> None:
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    current_minute = (now_ms // 60_000) * 60_000
+    source_candles = [
+        Candle(
+            open_time=current_minute - offset * 60_000,
+            open=100 + offset,
+            high=102 + offset,
+            low=99 + offset,
+            close=101 + offset,
+            volume=1,
+        )
+        for offset in (4, 3, 2, 1, -10)
+    ]
+    fetched_symbols: list[str] = []
+
+    async def fetcher(*args: object) -> list[Candle]:
+        fetched_symbols.append(str(args[2]))
+        return source_candles
+
+    monkeypatch.setattr(service_module, "fetch_source_candles", fetcher)
+    app = _batch_strategy_app(tmp_path, monkeypatch)
+    body = _backtest_body()
+    body["also"] = [
+        {"venue": "COINBASE", "symbol": "eth-usd"},
+        {"venue": "coinbase", "symbol": "LTC-USD"},
+    ]
+
+    with TestClient(app) as client:
+        response = client.post("/v1/backtest/batch", json=body)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert [(item["venue"], item["symbol"]) for item in data["results"]] == [
+            ("coinbase", "BTC-USD"),
+            ("coinbase", "ETH-USD"),
+            ("coinbase", "LTC-USD"),
+        ]
+        assert data["results"][0]["error"] is None
+        assert data["results"][0]["stats"]["trades"] == 2
+        assert data["results"][2]["error"] == "Unknown symbol."
+        assert data["results"][2]["stats"] is None
+        assert data["results"][2]["bars_tested"] is None
+        assert data["summary"]["instruments_tested"] == 2
+        assert data["summary"]["instruments_failed"] == 1
+        assert data["note"].startswith("Coins tend to move together")
+        assert "curve" not in data["results"][0]
+        assert "trades" not in data["results"][0]
+        assert sorted(fetched_symbols) == ["BTC-USD", "ETH-USD"]
+
+        repeated = client.post("/v1/backtest/batch", json=body)
+        assert repeated.status_code == 200
+        assert sorted(fetched_symbols) == ["BTC-USD", "ETH-USD"]
+
+
+def test_batch_backtest_rejects_normalized_duplicates_and_too_many_instruments(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = _batch_strategy_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        duplicate = _backtest_body()
+        duplicate["also"] = [{"venue": "COINBASE", "symbol": "btc-usd"}]
+        response = client.post("/v1/backtest/batch", json=duplicate)
+        assert response.status_code == 422
+        assert response.json()["detail"] == "Duplicate instrument."
+
+        excessive = _backtest_body()
+        excessive["also"] = [
+            {"venue": "coinbase", "symbol": f"SYMBOL-{index}-USD"} for index in range(20)
+        ]
+        assert client.post("/v1/backtest/batch", json=excessive).status_code == 422
+
+
+def test_batch_backtest_keeps_candle_fetch_failures_per_instrument(
+    tmp_path: Path, monkeypatch
+) -> None:
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    current_minute = (now_ms // 60_000) * 60_000
+    source_candles = [
+        Candle(
+            open_time=current_minute - offset * 60_000,
+            open=100 + offset,
+            high=102 + offset,
+            low=99 + offset,
+            close=101 + offset,
+            volume=1,
+        )
+        for offset in (4, 3, 2, 1)
+    ]
+
+    async def fetcher(
+        _client: object, _venue: str, symbol: str, _interval: str, _limit: int
+    ) -> list[Candle]:
+        if symbol == "ETH-USD":
+            raise RuntimeError("upstream unavailable")
+        return source_candles
+
+    monkeypatch.setattr(service_module, "fetch_source_candles", fetcher)
+    app = _batch_strategy_app(tmp_path, monkeypatch)
+    body = _backtest_body()
+    body["also"] = [{"venue": "coinbase", "symbol": "ETH-USD"}]
+
+    with TestClient(app) as client:
+        response = client.post("/v1/backtest/batch", json=body)
+
+    assert response.status_code == 200
+    assert response.json()["results"][1]["error"] == "upstream unavailable"
+    assert response.json()["results"][1]["stats"] is None
+    assert response.json()["summary"]["instruments_failed"] == 1
 
 
 def test_backtest_endpoint_maps_upstream_failure_to_502(tmp_path: Path, monkeypatch) -> None:

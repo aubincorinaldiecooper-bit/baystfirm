@@ -17,7 +17,9 @@ from baystfirm.strategies import (
     Rule,
     ValueOperand,
     backtest,
+    summarize_batch,
 )
+from baystfirm.track_record import _wilson_interval
 
 
 def candle(
@@ -446,6 +448,38 @@ def test_baseline_enters_every_eligible_bar_without_rule_signals() -> None:
     assert result.stats.trades == 0
     assert result.baseline.trades == 4
     assert result.baseline.win_rate == 0
+
+
+def test_batch_summary_counts_breadth_and_pools_full_stats_not_capped_trades() -> None:
+    up_closes = [close for _ in range(251) for close in (100, 110)]
+    up = backtest(rule(), [candle(index, close) for index, close in enumerate(up_closes)], 0)
+    down = backtest(
+        rule(expect="down"),
+        [candle(index, close) for index, close in enumerate([100, 110, 100, 120])],
+        0,
+    )
+    no_trades = backtest(
+        rule(threshold=1000),
+        [candle(index, close) for index, close in enumerate([100, 110, 100, 120])],
+        0,
+    )
+
+    summary = summarize_batch([up, down, no_trades])
+
+    assert len(up.trades) == 200
+    assert up.stats.trades == 251
+    assert summary.instruments_tested == 3
+    assert summary.instruments_failed == 0
+    assert summary.with_trades == 2
+    assert summary.beat_baseline == 1
+    assert summary.beat_buy_and_hold == 1
+    assert summary.median_avg_return_pct == pytest.approx(
+        (up.stats.avg_return_pct + down.stats.avg_return_pct) / 2
+    )
+    assert summary.pooled_trades == 253
+    assert summary.pooled_wins == 251
+    assert summary.pooled_win_rate == pytest.approx(251 / 253)
+    assert summary.pooled_win_rate_ci95 == _wilson_interval(251, 253)
 
 
 def test_tp_sl_only_rule_time_exits_after_max_hold_bars() -> None:

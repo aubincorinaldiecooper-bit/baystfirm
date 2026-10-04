@@ -127,6 +127,40 @@ reports the echoed `costs`, an `equity` curve with total return and maximum draw
 return/drawdown (always long, regardless of `expect`), UTC `by_year` statistics, and `holdout`
 in-sample/recent statistics. Set `holdout_pct` to `0` to omit the holdout result.
 
+`POST /v1/backtest/batch` evaluates the same rule on its `venue`/`symbol` and on 1–19 additional
+instruments in `also`, using the same bars and cost settings:
+
+```json
+{
+  "rule": {
+    "name": "Example rule",
+    "venue": "coinbase",
+    "symbol": "BTC-USD",
+    "interval": "1h",
+    "conditions": [
+      {
+        "left": {"kind": "price", "field": "close"},
+        "op": "above",
+        "right": {"kind": "value", "value": 0}
+      }
+    ],
+    "expect": "up",
+    "exit": {"after_bars": 24}
+  },
+  "bars": 1000,
+  "fee_bps": 10,
+  "slippage_bps": 5,
+  "holdout_pct": 20,
+  "also": [{"venue": "coinbase", "symbol": "ETH-USD"}]
+}
+```
+
+Batch results stay in request order—the rule's instrument first—and are not ranked by performance.
+The summary emphasizes breadth, including how many instruments had trades and beat the baseline.
+Coins can move together, so instruments are not independent tests; judge how broadly your rule
+holds up rather than selecting the best result. An invalid or unavailable instrument is reported
+as an error for that result while the rest of the batch continues.
+
 ## Configuration
 
 | Variable | Default | Purpose |

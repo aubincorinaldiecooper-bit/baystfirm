@@ -124,6 +124,15 @@ class BacktestRequest(StrictModel):
     holdout_pct: float = Field(default=20, ge=0, le=50)
 
 
+class Instrument(StrictModel):
+    venue: str
+    symbol: str
+
+
+class BatchBacktestRequest(BacktestRequest):
+    also: list[Instrument] = Field(min_length=1, max_length=19)
+
+
 class CompletedTrade(StrictModel):
     entry_time: int
     exit_time: int
@@ -213,6 +222,70 @@ class BacktestResult(StrictModel):
     trades: list[CompletedTrade]
     open_trades: list[OpenTrade]
     note: str = BACKTEST_NOTE
+
+
+BATCH_NOTE = (
+    "Coins tend to move together, so results across instruments are not independent tests. "
+    "Judge your rule by how many instruments it holds up on, not the best one. "
+    "Your rule, not investment advice."
+)
+
+
+class BatchInstrumentResult(StrictModel):
+    venue: str
+    symbol: str
+    error: str | None
+    bars_tested: int | None
+    truncated: bool | None
+    stats: BacktestStats | None
+    baseline: BaselineStats | None
+    buy_and_hold: BuyAndHoldStats | None
+    total_return_pct: float | None
+    max_drawdown_pct: float | None
+    recent: BacktestStats | None
+
+
+class BatchSummary(StrictModel):
+    instruments_tested: int
+    instruments_failed: int = 0
+    with_trades: int
+    beat_baseline: int
+    beat_buy_and_hold: int
+    median_avg_return_pct: float | None
+    pooled_trades: int
+    pooled_wins: int
+    pooled_win_rate: float | None
+    pooled_win_rate_ci95: list[float] | None
+
+
+def summarize_batch(results: Sequence[BacktestResult]) -> BatchSummary:
+    with_trades = [result for result in results if result.stats.trades > 0]
+    pooled_trades = sum(result.stats.trades for result in results)
+    pooled_wins = sum(result.stats.wins for result in results)
+    avg_returns = [
+        result.stats.avg_return_pct
+        for result in with_trades
+        if result.stats.avg_return_pct is not None
+    ]
+    return BatchSummary(
+        instruments_tested=len(results),
+        with_trades=len(with_trades),
+        beat_baseline=sum(
+            result.stats.avg_return_pct is not None
+            and result.baseline.avg_return_pct is not None
+            and result.stats.avg_return_pct > result.baseline.avg_return_pct
+            for result in results
+        ),
+        beat_buy_and_hold=sum(
+            result.equity.total_return_pct > result.buy_and_hold.return_pct
+            for result in with_trades
+        ),
+        median_avg_return_pct=median(avg_returns) if avg_returns else None,
+        pooled_trades=pooled_trades,
+        pooled_wins=pooled_wins,
+        pooled_win_rate=pooled_wins / pooled_trades if pooled_trades else None,
+        pooled_win_rate_ci95=_wilson_interval(pooled_wins, pooled_trades),
+    )
 
 
 def backtest(

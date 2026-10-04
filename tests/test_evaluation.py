@@ -142,3 +142,48 @@ def test_chart_classifier_uses_rules_classifier_as_realized_outcome() -> None:
     assert record.expected_label == "range_bound"
     assert record.normal_label == "range_bound"
     assert record.classifier == "gnsis_chart_momentum"
+
+
+def test_multi_horizon_predictions_only_match_same_horizon_outcomes() -> None:
+    start = datetime(2025, 1, 1, tzinfo=UTC)
+
+    def regime(label: str, seconds: int, horizon: int) -> Classification:
+        return Classification(
+            classifier="momentum_regime",
+            classifier_version="rules-0.1.0",
+            symbol="BTC-USDT",
+            label=label,
+            probability=0.8,
+            abstained=False,
+            horizon_seconds=horizon,
+            observed_at=start + timedelta(seconds=seconds),
+            evidence=[],
+            freshness_ms=10,
+        )
+
+    records = label_classifications(
+        [
+            regime("upward_momentum", 0, 60),
+            regime("upward_momentum", 0, 300),
+            regime("downward_momentum", 60, 300),
+            regime("range_bound", 300, 300),
+        ]
+    )
+
+    assert [(record.horizon_seconds, record.expected_label) for record in records] == [
+        (300, "range_bound")
+    ]
+
+
+def test_multi_horizon_evaluation_key_includes_horizon() -> None:
+    record = EvaluationRecord(
+        "upward_momentum",
+        "upward_momentum",
+        0.8,
+        False,
+        10,
+        "range_bound",
+        classifier="momentum_regime",
+        horizon_seconds=3600,
+    )
+    assert set(evaluate_by_classifier([record])) == {"momentum_regime:3600s"}

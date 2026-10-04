@@ -1,9 +1,24 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import Protocol
+
 from baystfirm.classifiers import MarketStateClassifier
 from baystfirm.hub import EventHub
 from baystfirm.models import Classification, EventType, MarketEvent
+from baystfirm.regime import MomentumRegimeClassifier
 from baystfirm.storage import EventStore
+
+
+class Classifier(Protocol):
+    def observe(self, event: MarketEvent) -> list[Classification]: ...
+
+
+def default_classifiers(*, shadow: bool) -> list[Classifier]:
+    return [
+        MarketStateClassifier(shadow=shadow),
+        MomentumRegimeClassifier(shadow=shadow),
+    ]
 
 
 class IntelligencePipeline:
@@ -11,22 +26,27 @@ class IntelligencePipeline:
         self,
         store: EventStore,
         hub: EventHub,
-        classifier: MarketStateClassifier,
+        classifiers: Sequence[Classifier],
     ) -> None:
         self.store = store
         self.hub = hub
-        self.classifier = classifier
+        self.classifiers = tuple(classifiers)
         self.classifications_generated = 0
         self.latest_events: dict[tuple[str, str, EventType], MarketEvent] = {}
-        self.latest_classifications: dict[tuple[str, str], Classification] = {}
+        self.latest_classifications: dict[tuple[str, str, int], Classification] = {}
 
     async def ingest(self, event: MarketEvent) -> None:
         await self.store.append_event(event)
         self.latest_events[(event.venue, event.symbol, event.event_type)] = event
         await self.hub.publish(event)
-        for classification in self.classifier.observe(event):
-            await self.store.append_classification(classification)
-            key = (classification.classifier, classification.symbol)
-            self.latest_classifications[key] = classification
-            await self.hub.publish(classification)
-            self.classifications_generated += 1
+        for classifier in self.classifiers:
+            for classification in classifier.observe(event):
+                await self.store.append_classification(classification)
+                key = (
+                    classification.classifier,
+                    classification.symbol,
+                    classification.horizon_seconds,
+                )
+                self.latest_classifications[key] = classification
+                await self.hub.publish(classification)
+                self.classifications_generated += 1

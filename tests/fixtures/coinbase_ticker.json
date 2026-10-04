@@ -1,0 +1,56 @@
+[
+  {
+    "channel": "ticker",
+    "timestamp": "2026-10-04T17:35:49.153465466Z",
+    "sequence_num": 0,
+    "events": [
+      {
+        "type": "snapshot",
+        "tickers": [
+          {
+            "type": "ticker",
+            "product_id": "BTC-USD",
+            "price": "85359.78",
+            "volume_24_h": "1745.57927294",
+            "low_24_h": "84537.72",
+            "high_24_h": "85468.43",
+            "low_52_w": "57717.55",
+            "high_52_w": "126296",
+            "price_percent_chg_24_h": "0.56669052029259",
+            "best_bid": "85359.78",
+            "best_ask": "85359.79",
+            "best_bid_quantity": "0.07718108",
+            "best_ask_quantity": "0.13195545"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "channel": "ticker",
+    "timestamp": "2026-10-04T17:35:49.288721436Z",
+    "sequence_num": 3,
+    "events": [
+      {
+        "type": "update",
+        "tickers": [
+          {
+            "type": "ticker",
+            "product_id": "BTC-USD",
+            "price": "85359.78",
+            "volume_24_h": "1745.57927294",
+            "low_24_h": "84537.72",
+            "high_24_h": "85468.43",
+            "low_52_w": "57717.55",
+            "high_52_w": "126296",
+            "price_percent_chg_24_h": "0.56669052029259",
+            "best_bid": "85359.78",
+            "best_ask": "85359.79",
+            "best_bid_quantity": "0.07718082",
+            "best_ask_quantity": "0.13195545"
+          }
+        ]
+      }
+    ]
+  }
+]

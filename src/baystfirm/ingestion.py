@@ -11,6 +11,7 @@ from baystfirm.adapters import (
     KrakenAdapter,
     MarketAdapter,
     OkxSpotAdapter,
+    OkxSwapAdapter,
 )
 from baystfirm.config import Settings
 from baystfirm.models import MarketEvent
@@ -24,7 +25,7 @@ def build_adapters(settings: Settings) -> list[MarketAdapter]:
         "coinbase": (CoinbaseAdapter,),
         "kraken": (KrakenAdapter,),
         "bybit": (BybitSpotAdapter, BybitLinearAdapter),
-        "okx": (OkxSpotAdapter,),
+        "okx": (OkxSpotAdapter, OkxSwapAdapter),
     }
     adapters: list[MarketAdapter] = []
     for venue in settings.enabled_venues:

@@ -1,0 +1,27 @@
+[
+  {
+    "arg": {
+      "channel": "liquidation-orders",
+      "instType": "SWAP"
+    },
+    "data": [
+      {
+        "details": [
+          {
+            "bkLoss": "0",
+            "bkPx": "0.6806",
+            "ccy": "",
+            "posSide": "long",
+            "side": "sell",
+            "sz": "338",
+            "ts": "1791135364507"
+          }
+        ],
+        "instFamily": "GRASS-USDT",
+        "instId": "GRASS-USDT-SWAP",
+        "instType": "SWAP",
+        "uly": "GRASS-USDT"
+      }
+    ]
+  }
+]

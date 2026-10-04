@@ -12,7 +12,6 @@ from typing import Any, TextIO
 import uvicorn
 
 from baystfirm.archive import _iter_archive_records, fetch_archive, normalized_symbol
-from baystfirm.classifiers import MarketStateClassifier
 from baystfirm.evaluation import (
     EvaluationRecord,
     PromotionGate,
@@ -27,6 +26,7 @@ from baystfirm.models import (
     MarketEvent,
     payload_digest,
 )
+from baystfirm.pipeline import default_classifiers
 from baystfirm.replay import ReplayRunner
 from baystfirm.storage import EventStore
 
@@ -97,11 +97,12 @@ def _serve(args: argparse.Namespace) -> None:
 async def _replay(args: argparse.Namespace) -> None:
     store = EventStore(args.database)
     await store.open()
-    classifier = MarketStateClassifier(shadow=True)
+    classifiers = default_classifiers(shadow=True)
 
     async def classify(event: MarketEvent) -> None:
-        for result in classifier.observe(event):
-            print(result.model_dump_json())
+        for classifier in classifiers:
+            for result in classifier.observe(event):
+                print(result.model_dump_json())
 
     try:
         count = await ReplayRunner(store).run(
@@ -118,7 +119,7 @@ async def _replay(args: argparse.Namespace) -> None:
 async def _evaluate_replay(args: argparse.Namespace) -> dict[str, object]:
     store = EventStore(args.database)
     await store.open()
-    classifier = MarketStateClassifier(shadow=True)
+    classifiers = default_classifiers(shadow=True)
     predictions: list[Classification] = []
     first: MarketEvent | None = None
     last: MarketEvent | None = None
@@ -127,7 +128,8 @@ async def _evaluate_replay(args: argparse.Namespace) -> dict[str, object]:
         nonlocal first, last
         first = first or event
         last = event
-        predictions.extend(classifier.observe(event))
+        for classifier in classifiers:
+            predictions.extend(classifier.observe(event))
 
     gate = PromotionGate()
     report: dict[str, object] = {}

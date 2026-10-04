@@ -42,10 +42,23 @@ def test_api_key_guards_v1_routes(tmp_path: Path) -> None:
     with TestClient(create_app(_settings(tmp_path, api_key="secret"))) as client:
         assert client.get("/health").status_code == 200
         assert client.get("/v1/snapshot").status_code == 401
+        assert client.get("/v1/track-record").status_code == 401
         wrong = client.get("/v1/snapshot", headers={"Authorization": "Bearer nope"})
         assert wrong.status_code == 401
         ok = client.get("/v1/snapshot", headers={"Authorization": "Bearer secret"})
         assert ok.status_code == 200
+        track_record = client.get(
+            "/v1/track-record",
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert track_record.status_code == 200
+        assert track_record.json()["window_hours"] == 24
+
+
+def test_track_record_window_hours_validation(tmp_path: Path) -> None:
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        assert client.get("/v1/track-record?window_hours=0").status_code == 422
+        assert client.get("/v1/track-record?window_hours=169").status_code == 422
 
 
 def test_snapshot_reports_latest_event_and_classification(tmp_path: Path) -> None:

@@ -11,6 +11,20 @@ import aiosqlite
 
 from baystfirm.models import Candle, Classification, MarketEvent
 
+ClassificationRow = tuple[
+    str,
+    str,
+    int,
+    str,
+    str,
+    float,
+    int,
+    float | None,
+    str | None,
+    int,
+    str | None,
+]
+
 
 class EventStore:
     def __init__(self, path: Path) -> None:
@@ -53,6 +67,12 @@ class EventStore:
                 shadow INTEGER NOT NULL,
                 payload TEXT NOT NULL
             )
+            """
+        )
+        await self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_classifications_observed_at
+            ON classifications(observed_at)
             """
         )
         await self._connection.execute(
@@ -213,6 +233,46 @@ class EventStore:
         row = await cursor.fetchone()
         await cursor.close()
         return int(row[0]) if row else 0
+
+    async def classification_rows_since(self, since: datetime) -> list[ClassificationRow]:
+        cursor = await self.connection.execute(
+            """
+            SELECT
+                classifier,
+                symbol,
+                json_extract(payload, '$.horizon_seconds'),
+                observed_at,
+                label,
+                probability,
+                abstained,
+                json_extract(payload, '$.freshness_ms'),
+                json_extract(payload, '$.classifier_version'),
+                shadow,
+                json_extract(payload, '$.calibration_status')
+            FROM classifications
+            WHERE observed_at >= ?
+            ORDER BY observed_at
+            """,
+            (since.isoformat(),),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [
+            (
+                str(row[0]),
+                str(row[1]),
+                int(row[2]),
+                str(row[3]),
+                str(row[4]),
+                float(row[5]),
+                int(row[6]),
+                None if row[7] is None else float(row[7]),
+                None if row[8] is None else str(row[8]),
+                int(row[9]),
+                None if row[10] is None else str(row[10]),
+            )
+            for row in rows
+        ]
 
     async def candles(
         self, venue: str, symbol: str, interval: str, limit: int

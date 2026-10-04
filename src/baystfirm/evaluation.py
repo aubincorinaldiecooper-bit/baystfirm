@@ -14,8 +14,10 @@ NORMAL_LABELS = {
     "stablecoin_peg": "pegged",
     "short_horizon_momentum": "range_bound",
     "gnsis_chart_momentum": "range_bound",
+    "momentum_regime": "range_bound",
 }
 OUTCOME_CLASSIFIER = {"gnsis_chart_momentum": "short_horizon_momentum"}
+MULTI_HORIZON = frozenset({"momentum_regime"})
 
 
 @dataclass(frozen=True)
@@ -27,6 +29,7 @@ class EvaluationRecord:
     latency_ms: float
     normal_label: str
     classifier: str = ""
+    horizon_seconds: int = 0
 
     @property
     def correct(self) -> bool:
@@ -147,7 +150,12 @@ def _expected_calibration_error(records: list[EvaluationRecord], bins: int) -> f
 def evaluate_by_classifier(records: Sequence[EvaluationRecord]) -> dict[str, EvaluationMetrics]:
     grouped: dict[str, list[EvaluationRecord]] = defaultdict(list)
     for record in records:
-        grouped[record.classifier].append(record)
+        group = (
+            f"{record.classifier}:{record.horizon_seconds}s"
+            if record.classifier in MULTI_HORIZON
+            else record.classifier
+        )
+        grouped[group].append(record)
     return {name: evaluate(items) for name, items in sorted(grouped.items())}
 
 
@@ -157,10 +165,10 @@ def label_classifications(
     tolerance_seconds: float = 5.0,
 ) -> list[EvaluationRecord]:
     """Label each prediction with the state the same classifier observed one horizon later."""
-    outcomes: dict[tuple[str, str], list[Classification]] = defaultdict(list)
+    outcomes: dict[tuple[str, str, int], list[Classification]] = defaultdict(list)
     for item in classifications:
         if not item.abstained:
-            outcomes[(item.classifier, item.symbol)].append(item)
+            outcomes[(item.classifier, item.symbol, item.horizon_seconds)].append(item)
     for items in outcomes.values():
         items.sort(key=lambda item: item.observed_at)
     times = {key: [item.observed_at for item in items] for key, items in outcomes.items()}
@@ -168,7 +176,7 @@ def label_classifications(
     records: list[EvaluationRecord] = []
     for prediction in classifications:
         outcome_classifier = OUTCOME_CLASSIFIER.get(prediction.classifier, prediction.classifier)
-        key = (outcome_classifier, prediction.symbol)
+        key = (outcome_classifier, prediction.symbol, prediction.horizon_seconds)
         target = prediction.observed_at + timedelta(seconds=prediction.horizon_seconds)
         candidates = times.get(key, [])
         index = bisect_left(candidates, target)
@@ -183,6 +191,7 @@ def label_classifications(
                 latency_ms=prediction.freshness_ms,
                 normal_label=NORMAL_LABELS.get(prediction.classifier, ""),
                 classifier=prediction.classifier,
+                horizon_seconds=prediction.horizon_seconds,
             )
         )
     return records

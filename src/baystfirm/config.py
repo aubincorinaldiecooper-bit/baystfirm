@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_VENUES = "coinbase,kraken,bybit,okx"
+DEFAULT_VENUES = "coinbase,kraken,bybit,okx,binanceus"
 DEFAULT_SYMBOLS = ",".join(
     (
         "BTC-USD",

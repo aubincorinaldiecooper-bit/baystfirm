@@ -20,6 +20,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 
+from baystfirm.candles import CandleNotFound, CandleService, CandleUnavailable
 from baystfirm.classifiers import MarketStateClassifier
 from baystfirm.config import Settings
 from baystfirm.evaluation import PromotionGate
@@ -89,6 +90,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
     v1 = APIRouter(prefix="/v1", dependencies=[Depends(require_api_key)])
+
+    @v1.get("/candles")
+    async def candles(
+        venue: str,
+        symbol: str,
+        interval: str = Query(pattern="^(1m|3m|5m|15m|30m|1h|2h|4h|6h|12h|1d|1w)$"),
+        limit: int = Query(default=300, ge=1, le=500),
+    ) -> dict[str, Any]:
+        try:
+            return await CandleService(runtime.settings, runtime.store).get(
+                venue, symbol, interval, limit
+            )
+        except CandleNotFound as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except CandleUnavailable as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
 
     @app.get("/health")
     async def health() -> dict[str, object]:

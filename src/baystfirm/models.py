@@ -96,6 +96,15 @@ class MarketEvent(BaseModel):
         )
 
 
+class Candle(BaseModel):
+    open_time: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
 class Evidence(BaseModel):
     metric: str
     value: float | str

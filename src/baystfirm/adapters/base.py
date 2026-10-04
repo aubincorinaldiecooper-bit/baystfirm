@@ -60,12 +60,15 @@ class MarketAdapter(ABC):
     def parse_message(self, raw: str) -> list[MarketEvent]:
         raise NotImplementedError
 
+    def connection_url(self) -> str:
+        return self.websocket_url
+
     async def run(self, emit: EmitEvent, stop: asyncio.Event) -> None:
         backoff_seconds = 1.0
         while not stop.is_set():
             try:
                 async with websockets.connect(
-                    self.websocket_url,
+                    self.connection_url(),
                     ping_interval=20,
                     ping_timeout=20,
                     max_queue=10_000,

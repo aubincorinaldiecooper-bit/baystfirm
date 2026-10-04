@@ -8,10 +8,12 @@ from typing import Any
 import httpx
 import pytest
 
+import baystfirm.candles as candle_module
 from baystfirm.candles import (
     CandleNotFound,
     CandleService,
     aggregate_candles,
+    fetch_source_candles,
     source_interval,
 )
 from baystfirm.config import Settings
@@ -79,6 +81,72 @@ async def test_public_candle_responses_are_normalized_and_cached(
     assert len(cached) == 2
     assert fetched_at is not None
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_okx_5000_candles_paginate_from_latest_to_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(candle_module, "OKX_HISTORY_PAGE_DELAY_SECONDS", 0)
+    requests: list[httpx.Request] = []
+    next_index = 4999
+    last_oldest: int | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal next_index, last_oldest
+        requests.append(request)
+        page = len(requests)
+        if page == 1:
+            assert request.url.path == "/api/v5/market/candles"
+            assert "after" not in request.url.params
+        else:
+            assert request.url.path == "/api/v5/market/history-candles"
+            assert request.url.params["after"] == str(last_oldest)
+
+        limit = int(request.url.params["limit"])
+        rows = []
+        for _ in range(limit):
+            timestamp = 1_700_000_000_000 + next_index * 3_600_000
+            rows.append([str(timestamp), "100", "101", "99", "100", "1", "1", "1", "1"])
+            next_index -= 1
+        last_oldest = min(int(row[0]) for row in rows)
+        return httpx.Response(200, json={"code": "0", "msg": "", "data": rows})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        candles = await fetch_source_candles(client, "okx", "BTC-USDT", "1h", 5000)
+
+    assert len(candles) == 5000
+    assert len({candle.open_time for candle in candles}) == 5000
+    assert candles == sorted(candles, key=lambda candle: candle.open_time)
+    assert requests[0].url.path == "/api/v5/market/candles"
+    assert all(request.url.path == "/api/v5/market/history-candles" for request in requests[1:])
+    assert requests[0].url.params["limit"] == "300"
+    assert requests[-1].url.params["limit"] == "200"
+    assert len(requests) == 17
+
+
+@pytest.mark.asyncio
+async def test_okx_empty_history_page_stops_pagination() -> None:
+    requests: list[httpx.Request] = []
+    rows = [
+        ["1700007200000", "100", "101", "99", "100", "1", "1", "1", "1"],
+        ["1700003600000", "100", "101", "99", "100", "1", "1", "1", "1"],
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            assert request.url.path == "/api/v5/market/candles"
+            return httpx.Response(200, json={"code": "0", "msg": "", "data": rows})
+        assert request.url.path == "/api/v5/market/history-candles"
+        assert request.url.params["after"] == "1700003600000"
+        return httpx.Response(200, json={"code": "0", "msg": "", "data": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        candles = await fetch_source_candles(client, "okx", "BTC-USDT", "1h", 5000)
+
+    assert len(requests) == 2
+    assert [candle.open_time for candle in candles] == [1_700_003_600_000, 1_700_007_200_000]
 
 
 @pytest.mark.asyncio

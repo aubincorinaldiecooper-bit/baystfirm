@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 from collections import defaultdict
 from collections.abc import Callable
@@ -45,6 +46,8 @@ SPOT_ONLY_VENUES = frozenset({"coinbase", "kraken", "binanceus"})
 PERPETUAL_VENUES = frozenset({"bybit", "okx"})
 MAX_LIMIT = 500
 MAX_NATIVE_PAGE = {"coinbase": 300, "kraken": 720, "bybit": 1000, "okx": 300, "binanceus": 1000}
+MAX_OKX_HISTORY_PAGE = 300
+OKX_HISTORY_PAGE_DELAY_SECONDS = 0.11
 
 NATIVE_INTERVALS: dict[str, dict[str, str]] = {
     "coinbase": {
@@ -124,6 +127,7 @@ SOURCE_URLS = {
     "okx": "https://www.okx.com/api/v5/market/candles",
     "binanceus": "https://api.binance.us/api/v3/klines",
 }
+OKX_HISTORY_URL = "https://www.okx.com/api/v5/market/history-candles"
 
 
 class CandleNotFound(Exception):
@@ -460,22 +464,25 @@ async def _fetch_bybit(
 async def _fetch_okx(
     client: httpx.AsyncClient, inst_id: str, bar: str, source_limit: int
 ) -> list[Candle]:
-    url = SOURCE_URLS["okx"]
     cursor: str | None = None
     output: list[Candle] = []
-    pages = math.ceil(source_limit / MAX_NATIVE_PAGE["okx"]) + 1
-    for _ in range(pages):
+    pages = math.ceil(source_limit / MAX_OKX_HISTORY_PAGE) + 2
+    for page in range(pages):
         unique_count = len({item.open_time for item in output})
         remaining = source_limit - unique_count
         if remaining <= 0:
             break
+        page_limit = MAX_NATIVE_PAGE["okx"] if page == 0 else MAX_OKX_HISTORY_PAGE
         params: dict[str, str] = {
             "instId": inst_id,
             "bar": bar,
-            "limit": str(min(MAX_NATIVE_PAGE["okx"], remaining)),
+            "limit": str(min(page_limit, remaining)),
         }
         if cursor is not None:
             params["after"] = cursor
+        if page > 1:
+            await asyncio.sleep(OKX_HISTORY_PAGE_DELAY_SECONDS)
+        url = SOURCE_URLS["okx"] if page == 0 else OKX_HISTORY_URL
         response = await client.get(url, params=params)
         rows = _okx_rows(_body_json(response, "OKX"))
         if not rows:
@@ -486,7 +493,8 @@ async def _fetch_okx(
         if len({item.open_time for item in output}) >= source_limit or next_cursor == cursor:
             break
         cursor = next_cursor
-    return output
+    unique = {item.open_time: item for item in output}
+    return sorted(unique.values(), key=lambda candle: candle.open_time)
 
 
 async def _fetch_binanceus(

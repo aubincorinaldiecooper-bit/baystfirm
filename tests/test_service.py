@@ -25,6 +25,7 @@ def test_health_and_evaluation_gate(tmp_path: Path) -> None:
         assert gate.status_code == 200
         assert gate.json()["status"] == "shadow"
         assert gate.json()["runs"] == []
+        assert gate.json()["thresholds"]["minimum_macro_recall"] == 0.5
 
 
 def _settings(tmp_path: Path, api_key: str | None = None) -> Settings:

@@ -48,7 +48,15 @@ from baystfirm.pipeline import IntelligencePipeline
 from baystfirm.regime import MomentumRegimeClassifier
 from baystfirm.sse import sse_frames
 from baystfirm.storage import EventStore
-from baystfirm.strategies import BacktestRequest, backtest
+from baystfirm.strategies import (
+    BATCH_NOTE,
+    BacktestRequest,
+    BacktestResult,
+    BatchBacktestRequest,
+    BatchInstrumentResult,
+    backtest,
+    summarize_batch,
+)
 from baystfirm.track_record import TrackRecordService
 
 logger = logging.getLogger(__name__)
@@ -178,29 +186,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }
         return result
 
-    @v1.post("/backtest")
-    async def run_backtest(request: BacktestRequest) -> dict[str, Any]:
-        rule = request.rule
+    async def load_backtest_candles(
+        venue: str, symbol: str, interval: str, bars: int
+    ) -> list[Candle]:
         try:
-            venue, symbol = validate_candle_request(
-                runtime.settings,
-                rule.venue,
-                rule.symbol,
-                rule.interval,
-            )
+            venue, symbol = validate_candle_request(runtime.settings, venue, symbol, interval)
         except CandleNotFound as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
 
-        cache_key = (venue, symbol, rule.interval, request.bars)
+        cache_key = (venue, symbol, interval, bars)
         cache_entry = runtime.backtest_candles.get(cache_key)
         if cache_entry is not None and monotonic() - cache_entry[0] < BACKTEST_CACHE_TTL_SECONDS:
             candles = cache_entry[1]
         else:
             try:
-                source_name = source_interval(venue, rule.interval)
+                source_name = source_interval(venue, interval)
                 source_seconds = INTERVAL_SECONDS[source_name]
-                target_seconds = INTERVAL_SECONDS[rule.interval]
-                source_limit = math.ceil(request.bars * target_seconds / source_seconds)
+                target_seconds = INTERVAL_SECONDS[interval]
+                source_limit = math.ceil(bars * target_seconds / source_seconds)
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     source_candles = await fetch_source_candles(
                         client,
@@ -216,16 +219,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     aggregate_candles(
                         normalized,
                         source_name,
-                        rule.interval,
+                        interval,
                         now_ms=now_ms,
                     )
-                    if source_name != rule.interval
+                    if source_name != interval
                     else normalized
                 )
                 interval_ms = target_seconds * 1000
                 candles = [
                     candle for candle in fetched if candle.open_time + interval_ms <= now_ms
-                ][-request.bars :]
+                ][-bars:]
             except Exception as error:
                 raise HTTPException(status_code=502, detail=str(error)) from error
             inserted_at = monotonic()
@@ -240,6 +243,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 del runtime.backtest_candles[oldest_key]
 
+        return candles
+
+    @v1.post("/backtest")
+    async def run_backtest(request: BacktestRequest) -> dict[str, Any]:
+        rule = request.rule
+        candles = await load_backtest_candles(
+            rule.venue,
+            rule.symbol,
+            rule.interval,
+            request.bars,
+        )
         result = await asyncio.to_thread(
             backtest,
             rule,
@@ -252,6 +266,120 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response["bars_requested"] = request.bars
         response["truncated"] = len(candles) < request.bars
         return response
+
+    @v1.post("/backtest/batch")
+    async def run_batch_backtest(request: BatchBacktestRequest) -> dict[str, Any]:
+        rule = request.rule
+        instruments = [(rule.venue, rule.symbol)] + [
+            (instrument.venue, instrument.symbol) for instrument in request.also
+        ]
+        validated: list[tuple[str, str, str | None]] = []
+        seen: set[tuple[str, str]] = set()
+        for raw_venue, raw_symbol in instruments:
+            normalized_key = (raw_venue.lower(), raw_symbol.upper())
+            if normalized_key in seen:
+                raise HTTPException(status_code=422, detail="Duplicate instrument.")
+            seen.add(normalized_key)
+            try:
+                venue, symbol = validate_candle_request(
+                    runtime.settings,
+                    raw_venue,
+                    raw_symbol,
+                    rule.interval,
+                )
+            except CandleNotFound as error:
+                validated.append((*normalized_key, str(error)))
+            else:
+                validated.append((venue, symbol, None))
+
+        semaphore = asyncio.Semaphore(4)
+
+        async def run_instrument(
+            venue: str, symbol: str, validation_error: str | None
+        ) -> tuple[BatchInstrumentResult, BacktestResult | None]:
+            if validation_error is not None:
+                return (
+                    BatchInstrumentResult(
+                        venue=venue,
+                        symbol=symbol,
+                        error=validation_error,
+                        bars_tested=None,
+                        truncated=None,
+                        stats=None,
+                        baseline=None,
+                        buy_and_hold=None,
+                        total_return_pct=None,
+                        max_drawdown_pct=None,
+                        recent=None,
+                    ),
+                    None,
+                )
+
+            async with semaphore:
+                try:
+                    candles = await load_backtest_candles(
+                        venue,
+                        symbol,
+                        rule.interval,
+                        request.bars,
+                    )
+                except HTTPException as error:
+                    return (
+                        BatchInstrumentResult(
+                            venue=venue,
+                            symbol=symbol,
+                            error=str(error.detail),
+                            bars_tested=None,
+                            truncated=None,
+                            stats=None,
+                            baseline=None,
+                            buy_and_hold=None,
+                            total_return_pct=None,
+                            max_drawdown_pct=None,
+                            recent=None,
+                        ),
+                        None,
+                    )
+
+                instrument_rule = rule.model_copy(update={"venue": venue, "symbol": symbol})
+                result = await asyncio.to_thread(
+                    backtest,
+                    instrument_rule,
+                    candles,
+                    request.fee_bps,
+                    slippage_bps=request.slippage_bps,
+                    holdout_pct=request.holdout_pct,
+                )
+                return (
+                    BatchInstrumentResult(
+                        venue=venue,
+                        symbol=symbol,
+                        error=None,
+                        bars_tested=result.bars_tested,
+                        truncated=len(candles) < request.bars,
+                        stats=result.stats,
+                        baseline=result.baseline,
+                        buy_and_hold=result.buy_and_hold,
+                        total_return_pct=result.equity.total_return_pct,
+                        max_drawdown_pct=result.equity.max_drawdown_pct,
+                        recent=result.holdout.recent if result.holdout is not None else None,
+                    ),
+                    result,
+                )
+
+        outcomes = await asyncio.gather(
+            *(run_instrument(venue, symbol, error) for venue, symbol, error in validated)
+        )
+        results = [outcome[0] for outcome in outcomes]
+        successful = [outcome[1] for outcome in outcomes if outcome[1] is not None]
+        summary = summarize_batch(successful).model_copy(
+            update={"instruments_failed": sum(result.error is not None for result in results)}
+        )
+        return {
+            "results": [result.model_dump(mode="json") for result in results],
+            "summary": summary.model_dump(mode="json"),
+            "note": BATCH_NOTE,
+        }
 
     @app.get("/health")
     async def health() -> dict[str, object]:

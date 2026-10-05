@@ -824,6 +824,52 @@ async def test_card_worker_preserves_top10_fact_written_during_rebuild() -> None
 
 
 @pytest.mark.asyncio
+async def test_card_worker_does_not_overwrite_detail_card_built_during_rebuild() -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(404))
+    ) as http:
+        engine = SolanaTokenEngine(
+            SolanaTokenClient(_settings(), http, rate_limits=RATE_LIMITS_OFF)
+        )
+        feed_card = solana_module._pending_card(
+            MINT,
+            "Bonk",
+            "BONK",
+            "2026-10-04T00:00:00+00:00",
+        )
+        detail_card = feed_card.model_copy(update={"name": "Detail Bonk"})
+        engine.tokens[MINT] = feed_card
+        engine._checked_at[MINT] = solana_module.monotonic() - 61
+
+        async def build_card(
+            mint: str,
+            *,
+            first_seen_at: str,
+            gecko_cross_check: bool,
+            fetch_top10: bool = True,
+            fetch_rugcheck: bool = True,
+            geckoterminal_priority: str = "background",
+        ) -> Any:
+            await asyncio.sleep(0)
+            engine.tokens[mint] = detail_card
+            engine._detail_checked_at[mint] = solana_module.monotonic()
+            return feed_card
+
+        engine.build_card = build_card
+        engine._queue_work("card", MINT)
+        worker = asyncio.create_task(engine.worker())
+        try:
+            await engine._queue.join()
+        finally:
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+
+    assert engine.tokens[MINT].name == "Detail Bonk"
+    assert MINT not in engine._rug_retry_at
+
+
+@pytest.mark.asyncio
 async def test_rugcheck_failure_does_not_hide_other_card_facts() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "rpc.example.invalid":

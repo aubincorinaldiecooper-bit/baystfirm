@@ -1815,8 +1815,21 @@ class SolanaTokenEngine:
             return
         if first_seen_at.tzinfo is None:
             first_seen_at = first_seen_at.replace(tzinfo=UTC)
-        age_seconds = (datetime.now(UTC) - first_seen_at.astimezone(UTC)).total_seconds()
+        now = datetime.now(UTC)
+        age_seconds = (now - first_seen_at.astimezone(UTC)).total_seconds()
         if not 0 <= age_seconds <= 24 * 60 * 60:
+            return
+        raw_pool_created_at = market_fact.value.get("pool_created_at")
+        if not isinstance(raw_pool_created_at, str) or not raw_pool_created_at.strip():
+            return
+        try:
+            pool_created_at = datetime.fromisoformat(raw_pool_created_at.replace("Z", "+00:00"))
+        except ValueError:
+            return
+        if pool_created_at.tzinfo is None:
+            pool_created_at = pool_created_at.replace(tzinfo=UTC)
+        pool_age_seconds = (now - pool_created_at.astimezone(UTC)).total_seconds()
+        if not 0 <= pool_age_seconds <= 24 * 60 * 60:
             return
         raw_liquidity = market_fact.value.get("total_liquidity_usd")
         if raw_liquidity is None:
@@ -1824,7 +1837,7 @@ class SolanaTokenEngine:
         liquidity = _optional_float(raw_liquidity)
         if liquidity is None or liquidity < 50_000 or not card.symbol:
             return
-        published_at = datetime.now(UTC)
+        published_at = now
         item = NewsItem(
             id=owned_news_id("solana_launch_liquidity", card.mint, card.first_seen_at),
             kind="token_event",

@@ -40,6 +40,8 @@ class Settings:
     solana_rpc_url: str = DEFAULT_SOLANA_RPC_URL
     rugcheck_api_key: str | None = None
     solana_tokens_enabled: bool = True
+    news_enabled: bool = True
+    sec_user_agent: str = "Baystfirm/0.1 aubincorinaldiecooper@gmail.com"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -63,4 +65,9 @@ class Settings:
             rugcheck_api_key=os.getenv("BAYST_RUGCHECK_API_KEY", "").strip() or None,
             solana_tokens_enabled=os.getenv("BAYST_SOLANA_TOKENS", "true").lower()
             not in {"0", "false", "no"},
+            news_enabled=os.getenv("BAYST_NEWS", "true").lower() not in {"0", "false", "no"},
+            sec_user_agent=os.getenv(
+                "BAYST_SEC_USER_AGENT",
+                "Baystfirm/0.1 aubincorinaldiecooper@gmail.com",
+            ),
         )

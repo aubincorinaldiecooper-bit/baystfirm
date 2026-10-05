@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from solders.pubkey import Pubkey
 
 from baystfirm.config import DEFAULT_SOLANA_RPC_URL, Settings
+from baystfirm.news import NewsItem, format_usd_amount, owned_news_id
 
 logger = logging.getLogger(__name__)
 FactStatus = Literal["ok", "unavailable", "not_applicable"]
@@ -1277,8 +1278,14 @@ def _safe_image_url(pairs: list[dict[str, Any]]) -> str | None:
 
 
 class SolanaTokenEngine:
-    def __init__(self, checker: SolanaTokenClient) -> None:
+    def __init__(
+        self,
+        checker: SolanaTokenClient,
+        *,
+        news_sink: Callable[[NewsItem], Awaitable[None]] | None = None,
+    ) -> None:
         self.checker = checker
+        self.news_sink = news_sink
         self.tokens: OrderedDict[str, TokenCard] = OrderedDict()
         self.updated_at: str | None = None
         self.ready = False
@@ -1289,6 +1296,8 @@ class SolanaTokenEngine:
         self._top_retry_at: dict[str, float] = {}
         self._rug_retry_at: dict[str, float] = {}
         self._rug_retry_attempted: set[str] = set()
+        self._launch_news_emitted: set[str] = set()
+        self._liquidity_drop_last_emitted: dict[str, float] = {}
         self._queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self._queued: set[tuple[str, str]] = set()
 
@@ -1413,6 +1422,10 @@ class SolanaTokenEngine:
                         if isinstance(pair.get("pairAddress"), str)
                     }
                 self._update_facts(mint, market=market_fact, liquidity_lock=lock_fact)
+                await self._maybe_emit_liquidity_drop(old_card, old_market_value, market_fact)
+                updated_card = self.tokens.get(mint)
+                if updated_card is not None:
+                    await self._maybe_emit_launch(updated_card)
 
     def schedule_retries(self, *, max_top_holder_retries: int = 10) -> None:
         now = monotonic()
@@ -1472,6 +1485,7 @@ class SolanaTokenEngine:
                             }
                         )
                     self._store_card(card, checked=True, update_top_retry=False)
+                    await self._maybe_emit_launch(card)
                     if card.second_opinion.status == "unavailable":
                         self._rug_retry_at[mint] = monotonic() + 600
                     else:
@@ -1748,6 +1762,7 @@ class SolanaTokenEngine:
         if existing is not None:
             self._store_card(card, checked=True)
             self._detail_checked_at[mint] = monotonic()
+            await self._maybe_emit_launch(card)
         return card
 
     def _store_card(
@@ -1777,6 +1792,138 @@ class SolanaTokenEngine:
             self._rug_retry_at.setdefault(card.mint, monotonic() + 600)
         elif card.second_opinion.status == "ok":
             self._rug_retry_at.pop(card.mint, None)
+
+    async def _publish_news_item(self, item: NewsItem) -> bool:
+        if self.news_sink is None:
+            return False
+        try:
+            await self.news_sink(item)
+        except Exception:
+            logger.exception("Could not store Solana token news item %s", item.id)
+            return False
+        return True
+
+    async def _maybe_emit_launch(self, card: TokenCard) -> None:
+        if self.news_sink is None or card.mint in self._launch_news_emitted:
+            return
+        market_fact = card.facts.market
+        if market_fact.status != "ok" or not isinstance(market_fact.value, Mapping):
+            return
+        try:
+            first_seen_at = datetime.fromisoformat(card.first_seen_at.replace("Z", "+00:00"))
+        except ValueError:
+            return
+        if first_seen_at.tzinfo is None:
+            first_seen_at = first_seen_at.replace(tzinfo=UTC)
+        age_seconds = (datetime.now(UTC) - first_seen_at.astimezone(UTC)).total_seconds()
+        if not 0 <= age_seconds <= 24 * 60 * 60:
+            return
+        raw_liquidity = market_fact.value.get("total_liquidity_usd")
+        if raw_liquidity is None:
+            raw_liquidity = market_fact.value.get("liquidity_usd")
+        liquidity = _optional_float(raw_liquidity)
+        if liquidity is None or liquidity < 50_000 or not card.symbol:
+            return
+        published_at = datetime.now(UTC)
+        item = NewsItem(
+            id=owned_news_id("solana_launch_liquidity", card.mint, card.first_seen_at),
+            kind="token_event",
+            source="baystfirm",
+            source_label="Baystfirm (measured)",
+            title=(
+                f"New Solana token {card.symbol} launched with "
+                f"{format_usd_amount(liquidity)} liquidity"
+            ),
+            url=None,
+            published_at=published_at,
+            symbols=[card.mint],
+            details={
+                "rule": "solana_launch_liquidity",
+                "symbol": card.symbol,
+                "mint": card.mint,
+                "total_liquidity_usd": liquidity,
+                "main_liquidity_usd": _optional_float(market_fact.value.get("liquidity_usd")),
+                "main_pool_address": (
+                    market_fact.value.get("main_pool", {}).get("address")
+                    if isinstance(market_fact.value.get("main_pool"), Mapping)
+                    else None
+                ),
+                "dex": (
+                    market_fact.value.get("main_pool", {}).get("dex")
+                    if isinstance(market_fact.value.get("main_pool"), Mapping)
+                    else None
+                ),
+            },
+        )
+        if await self._publish_news_item(item):
+            self._launch_news_emitted.add(card.mint)
+
+    async def _maybe_emit_liquidity_drop(
+        self,
+        card: TokenCard,
+        previous_market: Mapping[str, Any],
+        market_fact: Fact,
+    ) -> None:
+        if self.news_sink is None or card.facts.market.status != "ok" or market_fact.status != "ok":
+            return
+        current_market = market_fact.value
+        if not isinstance(current_market, Mapping) or not card.symbol:
+            return
+        previous_main = previous_market.get("main_pool")
+        current_main = current_market.get("main_pool")
+        if not isinstance(previous_main, Mapping) or not isinstance(current_main, Mapping):
+            return
+        old_pool = previous_main.get("address")
+        new_pool = current_main.get("address")
+        if not isinstance(old_pool, str) or not old_pool or old_pool != new_pool:
+            return
+        previous_liquidity = _optional_float(previous_market.get("liquidity_usd"))
+        current_liquidity = _optional_float(current_market.get("liquidity_usd"))
+        if (
+            previous_liquidity is None
+            or current_liquidity is None
+            or previous_liquidity < 10_000
+            or current_liquidity > previous_liquidity * 0.5
+        ):
+            return
+        now_monotonic = monotonic()
+        last_emitted = self._liquidity_drop_last_emitted.get(card.mint)
+        if last_emitted is not None and now_monotonic - last_emitted < 6 * 60 * 60:
+            return
+        drop_pct = (previous_liquidity - current_liquidity) / previous_liquidity * 100
+        try:
+            published_at = (
+                datetime.fromisoformat(market_fact.fetched_at.replace("Z", "+00:00"))
+                if market_fact.fetched_at
+                else datetime.now(UTC)
+            )
+        except ValueError:
+            published_at = datetime.now(UTC)
+        item = NewsItem(
+            id=owned_news_id("solana_liquidity_drop", card.mint, published_at),
+            kind="token_event",
+            source="baystfirm",
+            source_label="Baystfirm (measured)",
+            title=(
+                f"{card.symbol} liquidity fell {drop_pct:.0f}% "
+                f"({format_usd_amount(previous_liquidity)} → "
+                f"{format_usd_amount(current_liquidity)}) on {current_main.get('dex') or 'unknown'}"
+            ),
+            url=None,
+            published_at=published_at,
+            symbols=[card.mint],
+            details={
+                "rule": "solana_liquidity_drop",
+                "symbol": card.symbol,
+                "mint": card.mint,
+                "liquidity_before_usd": previous_liquidity,
+                "liquidity_after_usd": current_liquidity,
+                "pool_address": new_pool,
+                "dex": current_main.get("dex") or "unknown",
+            },
+        )
+        if await self._publish_news_item(item):
+            self._liquidity_drop_last_emitted[card.mint] = now_monotonic
 
     def _update_facts(self, mint: str, **updates: Fact) -> None:
         card = self.tokens.get(mint)

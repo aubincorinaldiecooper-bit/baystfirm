@@ -1448,6 +1448,7 @@ class SolanaTokenEngine:
                     checked_at = self._checked_at.get(mint)
                     if checked_at is not None and monotonic() - checked_at < 60:
                         continue
+                    rebuild_started = monotonic()
                     try:
                         card = await self.build_card(
                             mint,
@@ -1457,6 +1458,9 @@ class SolanaTokenEngine:
                         )
                     except NotTokenMint:
                         self._update_all_unavailable(mint, "Address is not a token mint.")
+                        continue
+                    detail_at = self._detail_checked_at.get(mint)
+                    if detail_at is not None and detail_at >= rebuild_started:
                         continue
                     current = self.tokens.get(mint)
                     if current is not None:

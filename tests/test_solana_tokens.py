@@ -130,19 +130,30 @@ async def test_geckoterminal_bucket_refills_one_token_every_six_seconds() -> Non
 async def test_background_reserves_three_tokens_for_interactive_requests() -> None:
     clock = FakeClock()
     bucket = GeckoTerminalTokenBucket(clock=clock.time, sleep=clock.sleep)
+    bucket._tokens = 3.1
+    bucket._last_refill = clock.time()
 
-    for _ in range(7):
+    async def block_sleep(seconds: float) -> None:
+        clock.sleeps.append(seconds)
+        raise asyncio.CancelledError
+
+    bucket.sleep = block_sleep
+    with pytest.raises(asyncio.CancelledError):
         await bucket.wait(priority="background")
-    assert bucket.tokens == 3
+    assert bucket.tokens == pytest.approx(3.1)
+    assert clock.sleeps == [pytest.approx(5.400001)]
 
-    sleeps_before_interactive = len(clock.sleeps)
-    await bucket.wait(priority="interactive")
-    assert len(clock.sleeps) == sleeps_before_interactive
-    assert bucket.tokens == 2
-
+    bucket.sleep = clock.sleep
+    bucket._tokens = 4.0
+    bucket._last_refill = clock.time()
     await bucket.wait(priority="background")
-    assert clock.sleeps[-1] > 6
-    assert bucket.tokens <= 2.000001
+    assert bucket.tokens == pytest.approx(3.0)
+
+    bucket._tokens = 3.1
+    bucket._last_refill = clock.time()
+    await bucket.wait(priority="interactive")
+    assert bucket.tokens == pytest.approx(2.1)
+    assert clock.sleeps == [pytest.approx(5.400001)]
 
 
 @pytest.mark.asyncio
@@ -683,10 +694,133 @@ async def test_feed_card_queues_holder_lookup_without_liquidity_cross_check(
             "geckoterminal_priority": "background",
         }
     ]
-    await engine.get_card(MINT, max_age_seconds=0)
+    await engine.get_card(MINT)
+    assert calls[-1]["gecko_cross_check"] is True
     assert calls[-1]["geckoterminal_priority"] == "interactive"
+    detail_call_count = len(calls)
+    await engine.get_card(MINT)
+    assert len(calls) == detail_call_count
     engine.schedule_retries()
     assert ("top10", MINT) in engine._queued
+
+
+@pytest.mark.asyncio
+async def test_card_worker_preserves_stored_top10_fact_and_retry_state() -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(404))
+    ) as http:
+        engine = SolanaTokenEngine(
+            SolanaTokenClient(_settings(), http, rate_limits=RATE_LIMITS_OFF)
+        )
+        feed_card = solana_module._pending_card(
+            MINT,
+            "Bonk",
+            "BONK",
+            "2026-10-04T00:00:00+00:00",
+        )
+        top10 = solana_module.Fact(
+            status="ok",
+            value={
+                "pct": 38.4,
+                "holder_count": 100,
+                "as_of": "2026-10-04T00:00:00+00:00",
+                "pool_accounts_excluded": False,
+                "holders": [],
+            },
+            source="geckoterminal",
+            fetched_at="2026-10-04T00:00:00+00:00",
+        )
+        engine.tokens[MINT] = feed_card.model_copy(
+            update={"facts": feed_card.facts.model_copy(update={"top10_share": top10})}
+        )
+        engine._checked_at[MINT] = solana_module.monotonic() - 61
+        engine._top_retry_count[MINT] = 3
+        retry_at = solana_module.monotonic() + 60
+        engine._top_retry_at[MINT] = retry_at
+
+        async def build_card(
+            mint: str,
+            *,
+            first_seen_at: str,
+            gecko_cross_check: bool,
+            fetch_top10: bool = True,
+            fetch_rugcheck: bool = True,
+            geckoterminal_priority: str = "background",
+        ) -> Any:
+            return feed_card
+
+        engine.build_card = build_card
+        engine._queue_work("card", MINT)
+        worker = asyncio.create_task(engine.worker())
+        try:
+            await engine._queue.join()
+        finally:
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+
+    stored = engine.tokens[MINT]
+    assert stored.facts.top10_share == top10
+    assert engine._top_retry_count[MINT] == 3
+    assert engine._top_retry_at[MINT] == retry_at
+
+
+@pytest.mark.asyncio
+async def test_card_worker_preserves_top10_fact_written_during_rebuild() -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(404))
+    ) as http:
+        engine = SolanaTokenEngine(
+            SolanaTokenClient(_settings(), http, rate_limits=RATE_LIMITS_OFF)
+        )
+        feed_card = solana_module._pending_card(
+            MINT,
+            "Bonk",
+            "BONK",
+            "2026-10-04T00:00:00+00:00",
+        )
+        top10 = solana_module.Fact(
+            status="ok",
+            value={
+                "pct": 38.4,
+                "holder_count": 100,
+                "as_of": "2026-10-04T00:00:00+00:00",
+                "pool_accounts_excluded": False,
+                "holders": [],
+            },
+            source="geckoterminal",
+            fetched_at="2026-10-04T00:00:00+00:00",
+        )
+        engine.tokens[MINT] = feed_card
+        engine._checked_at[MINT] = solana_module.monotonic() - 61
+
+        async def build_card(
+            mint: str,
+            *,
+            first_seen_at: str,
+            gecko_cross_check: bool,
+            fetch_top10: bool = True,
+            fetch_rugcheck: bool = True,
+            geckoterminal_priority: str = "background",
+        ) -> Any:
+            await asyncio.sleep(0)
+            current = engine.tokens[mint]
+            engine.tokens[mint] = current.model_copy(
+                update={"facts": current.facts.model_copy(update={"top10_share": top10})}
+            )
+            return feed_card
+
+        engine.build_card = build_card
+        engine._queue_work("card", MINT)
+        worker = asyncio.create_task(engine.worker())
+        try:
+            await engine._queue.join()
+        finally:
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+
+    assert engine.tokens[MINT].facts.top10_share == top10
 
 
 @pytest.mark.asyncio

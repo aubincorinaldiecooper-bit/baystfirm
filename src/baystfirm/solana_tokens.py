@@ -244,18 +244,12 @@ class GeckoTerminalTokenBucket:
                 else:
                     reserve = self.background_reserve if priority == "background" else 0.0
                     if self._tokens >= 1.0 and (
-                        priority == "interactive" or self._tokens > reserve
+                        priority == "interactive" or self._tokens - 1.0 >= reserve
                     ):
                         self._tokens -= 1.0
                         return
                     if priority == "background":
-                        delay = (
-                            max(
-                                (reserve - self._tokens) * self.refill_seconds,
-                                (1.0 - self._tokens) * self.refill_seconds,
-                            )
-                            + 1e-6
-                        )
+                        delay = (reserve + 1.0 - self._tokens) * self.refill_seconds + 1e-6
                     else:
                         remaining = (deadline or now) - now
                         if remaining <= 0:
@@ -1289,6 +1283,7 @@ class SolanaTokenEngine:
         self.updated_at: str | None = None
         self.ready = False
         self._checked_at: dict[str, float | None] = {}
+        self._detail_checked_at: dict[str, float] = {}
         self._pool_addresses: dict[str, set[str]] = {}
         self._top_retry_count: dict[str, int] = {}
         self._top_retry_at: dict[str, float] = {}
@@ -1331,6 +1326,7 @@ class SolanaTokenEngine:
             while len(self.tokens) > 200:
                 expired_mint, _ = self.tokens.popitem(last=False)
                 self._checked_at.pop(expired_mint, None)
+                self._detail_checked_at.pop(expired_mint, None)
                 self._pool_addresses.pop(expired_mint, None)
                 self._top_retry_count.pop(expired_mint, None)
                 self._top_retry_at.pop(expired_mint, None)
@@ -1462,7 +1458,16 @@ class SolanaTokenEngine:
                     except NotTokenMint:
                         self._update_all_unavailable(mint, "Address is not a token mint.")
                         continue
-                    self._store_card(card, checked=True)
+                    current = self.tokens.get(mint)
+                    if current is not None:
+                        card = card.model_copy(
+                            update={
+                                "facts": card.facts.model_copy(
+                                    update={"top10_share": current.facts.top10_share}
+                                )
+                            }
+                        )
+                    self._store_card(card, checked=True, update_top_retry=False)
                     if card.second_opinion.status == "unavailable":
                         self._rug_retry_at[mint] = monotonic() + 600
                     else:
@@ -1705,7 +1710,7 @@ class SolanaTokenEngine:
 
     async def get_card(self, mint: str, *, max_age_seconds: float = 60.0) -> TokenCard:
         validate_mint(mint)
-        checked_at = self._checked_at.get(mint)
+        checked_at = self._detail_checked_at.get(mint)
         if (
             mint in self.tokens
             and checked_at is not None
@@ -1738,21 +1743,29 @@ class SolanaTokenEngine:
         )
         if existing is not None:
             self._store_card(card, checked=True)
+            self._detail_checked_at[mint] = monotonic()
         return card
 
-    def _store_card(self, card: TokenCard, *, checked: bool) -> None:
+    def _store_card(
+        self,
+        card: TokenCard,
+        *,
+        checked: bool,
+        update_top_retry: bool = True,
+    ) -> None:
         if card.mint in self.tokens:
             self.tokens[card.mint] = card
         if checked:
             self._checked_at[card.mint] = monotonic()
-        top_fact = card.facts.top10_share
-        if top_fact.status == "ok":
-            self._top_retry_count.pop(card.mint, None)
-            self._top_retry_at.pop(card.mint, None)
-        elif _is_geckoterminal_rate_limit(top_fact):
-            self._top_retry_at[card.mint] = monotonic() + TOP_HOLDER_RATE_LIMIT_RETRY_SECONDS
-        elif top_fact.detail != "Check pending":
-            self._top_retry_at.setdefault(card.mint, monotonic() + TOP_HOLDER_RETRY_SECONDS)
+        if update_top_retry:
+            top_fact = card.facts.top10_share
+            if top_fact.status == "ok":
+                self._top_retry_count.pop(card.mint, None)
+                self._top_retry_at.pop(card.mint, None)
+            elif _is_geckoterminal_rate_limit(top_fact):
+                self._top_retry_at[card.mint] = monotonic() + TOP_HOLDER_RATE_LIMIT_RETRY_SECONDS
+            elif top_fact.detail != "Check pending":
+                self._top_retry_at.setdefault(card.mint, monotonic() + TOP_HOLDER_RETRY_SECONDS)
         if (
             card.second_opinion.status == "unavailable"
             and card.mint not in self._rug_retry_attempted

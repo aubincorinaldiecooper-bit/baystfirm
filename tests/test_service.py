@@ -541,6 +541,10 @@ def test_solana_token_candles_map_intervals_cache_and_add_indicators(
             f"/v1/solana/tokens/{mint}/candles",
             params=[("interval", "1h"), ("limit", "2")],
         )
+        different_indicator = client.get(
+            f"/v1/solana/tokens/{mint}/candles",
+            params=[("interval", "1h"), ("limit", "2"), ("indicator", "sma:3")],
+        )
         intervals = {
             "1m": ("minute", 1),
             "5m": ("minute", 5),
@@ -570,6 +574,7 @@ def test_solana_token_candles_map_intervals_cache_and_add_indicators(
     assert body["pool_address"] == "pool-main"
     assert body["dex_id"] == "orca"
     assert body["price_currency"] == "usd"
+    assert set(body["indicators"]) == {"sma:2"}
     assert [candle["open_time"] for candle in body["candles"]] == [
         1_730_000_000_000,
         1_730_000_060_000,
@@ -577,6 +582,8 @@ def test_solana_token_candles_map_intervals_cache_and_add_indicators(
     assert [candle["volume"] for candle in body["candles"]] == [10, 20]
     assert body["indicators"]["sma:2"]["value"] == [None, 1.75]
     assert cached.status_code == 200
+    assert "indicators" not in cached.json()
+    assert set(different_indicator.json()["indicators"]) == {"sma:3"}
     assert len(calls) == 7
     assert calls[0][1] == ("https://api.dexscreener.com/token-pairs/v1/solana/" + mint)
     gecko_calls = [call for call in calls if call[0] == "geckoterminal"]
@@ -666,6 +673,7 @@ def test_solana_token_candles_stale_cache_and_unavailable_response(
         stale = client.get(path)
 
     assert fresh.status_code == 200
+    assert fresh.json()["truncated"] is True
     assert stale.status_code == 200
     assert stale.json()["stale"] is True
 

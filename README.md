@@ -28,6 +28,8 @@ python3 -m venv .venv
 .venv/bin/baystfirm serve --reload
 ```
 
+CI runs these same checks on every PR (.github/workflows/ci.yml).
+
 The API is served at `http://127.0.0.1:8000`. The realtime normalized stream is available over
 WebSocket at `/v1/stream` and as server-sent events at `/v1/stream/sse` (optional
 `?symbols=USDC-USD,BTC-USD`; `market_event` and `classification` events, a keepalive comment every

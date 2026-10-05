@@ -727,7 +727,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "aggregated_from": None,
             "candles": candle_rows,
             "stale": False,
-            "truncated": False,
+            "truncated": len(candle_rows) < limit,
             "mint": mint,
             "pool_address": pool_address,
             "dex_id": str(main_pool.get("dexId") or "unknown"),
@@ -737,7 +737,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         runtime.solana_candle_cache.move_to_end(cache_key)
         while len(runtime.solana_candle_cache) > SOLANA_CANDLE_CACHE_MAX_ENTRIES:
             runtime.solana_candle_cache.popitem(last=False)
-        return _apply_requested_indicators(result, specs)
+        return _apply_requested_indicators(dict(result), specs)
 
     @v1.get("/solana/tokens/{mint}")
     async def solana_token(mint: str) -> dict[str, Any]:

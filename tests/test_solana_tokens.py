@@ -962,6 +962,122 @@ async def test_expired_geckoterminal_holder_cache_falls_back_on_source_error(
 
 
 @pytest.mark.asyncio
+async def test_expired_geckoterminal_holder_cache_falls_back_on_empty_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(solana_module, "monotonic", clock.time)
+    request_count = 0
+
+    async def get_json(
+        source: str,
+        url: str,
+        *,
+        priority: str = "background",
+    ) -> dict[str, Any]:
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            return _geckoterminal_holder_response()
+        return {"data": {"attributes": {"holders": None}}}
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(404))
+    ) as http:
+        checker = SolanaTokenClient(_settings(), http, rate_limits=RATE_LIMITS_OFF)
+        monkeypatch.setattr(checker, "get_json", get_json)
+
+        first = await checker.geckoterminal_top10_share(MINT)
+        clock.advance(solana_module.GECKOTERMINAL_HOLDERS_CACHE_TTL_SECONDS + 1)
+        second = await checker.geckoterminal_top10_share(MINT)
+
+    assert request_count == 2
+    assert second is first
+    assert second.status == "ok"
+    assert second.fetched_at == first.fetched_at
+
+
+@pytest.mark.asyncio
+async def test_concurrent_geckoterminal_holder_lookups_share_inflight_request() -> None:
+    request_started = asyncio.Event()
+    release_request = asyncio.Event()
+    request_count = 0
+
+    async def get_json(
+        source: str,
+        url: str,
+        *,
+        priority: str = "background",
+    ) -> dict[str, Any]:
+        nonlocal request_count
+        request_count += 1
+        request_started.set()
+        await release_request.wait()
+        return _geckoterminal_holder_response()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(404))
+    ) as http:
+        checker = SolanaTokenClient(_settings(), http, rate_limits=RATE_LIMITS_OFF)
+        checker.get_json = get_json
+
+        first_task = asyncio.create_task(checker.geckoterminal_top10_share(MINT))
+        await request_started.wait()
+        second_task = asyncio.create_task(checker.geckoterminal_top10_share(MINT))
+        await asyncio.sleep(0)
+        release_request.set()
+        first, second = await asyncio.gather(first_task, second_task)
+        await asyncio.sleep(0)
+
+    assert request_count == 1
+    assert first == second
+    assert first.status == "ok"
+    assert checker._holders_inflight == {}
+
+
+@pytest.mark.asyncio
+async def test_failed_concurrent_geckoterminal_holder_lookup_can_retry() -> None:
+    request_started = asyncio.Event()
+    release_request = asyncio.Event()
+    request_count = 0
+
+    async def get_json(
+        source: str,
+        url: str,
+        *,
+        priority: str = "background",
+    ) -> dict[str, Any]:
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            request_started.set()
+            await release_request.wait()
+            raise SourceError("geckoterminal", "upstream unavailable")
+        return _geckoterminal_holder_response("12.5")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(404))
+    ) as http:
+        checker = SolanaTokenClient(_settings(), http, rate_limits=RATE_LIMITS_OFF)
+        checker.get_json = get_json
+
+        first_task = asyncio.create_task(checker.geckoterminal_top10_share(MINT))
+        await request_started.wait()
+        second_task = asyncio.create_task(checker.geckoterminal_top10_share(MINT))
+        await asyncio.sleep(0)
+        release_request.set()
+        first, second = await asyncio.gather(first_task, second_task)
+        await asyncio.sleep(0)
+        third = await checker.geckoterminal_top10_share(MINT)
+
+    assert first.status == "unavailable"
+    assert second == first
+    assert request_count == 2
+    assert third.status == "ok"
+    assert checker._holders_inflight == {}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("first_result", ["error", "no_data"])
 async def test_unavailable_geckoterminal_holder_results_are_not_cached(
     monkeypatch: pytest.MonkeyPatch,

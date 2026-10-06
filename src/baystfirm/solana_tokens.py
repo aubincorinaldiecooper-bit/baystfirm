@@ -560,6 +560,7 @@ class SolanaTokenClient:
         self.sources = {source: _source_status(source) for source in SOURCE_NAMES}
         self._request_id = 0
         self._holders_cache: OrderedDict[str, tuple[float, Fact]] = OrderedDict()
+        self._holders_inflight: dict[str, asyncio.Task[Fact]] = {}
 
     async def rpc(self, method: str, params: list[Any], *, largest: bool = False) -> Any:
         limiter_name = "solana_largest" if largest else "solana_rpc"
@@ -938,6 +939,25 @@ class SolanaTokenClient:
             if monotonic() - cached_at < GECKOTERMINAL_HOLDERS_CACHE_TTL_SECONDS:
                 self._holders_cache.move_to_end(mint)
                 return cached_fact
+        task = self._holders_inflight.get(mint)
+        if task is not None:
+            return await asyncio.shield(task)
+        task = asyncio.create_task(self._fetch_geckoterminal_holders(mint, cached, priority))
+        self._holders_inflight[mint] = task
+
+        def clear_inflight(completed_task: asyncio.Task[Fact]) -> None:
+            if self._holders_inflight.get(mint) is completed_task:
+                self._holders_inflight.pop(mint, None)
+
+        task.add_done_callback(clear_inflight)
+        return await asyncio.shield(task)
+
+    async def _fetch_geckoterminal_holders(
+        self,
+        mint: str,
+        cached: tuple[float, Fact] | None,
+        priority: Literal["background", "interactive"],
+    ) -> Fact:
         try:
             body = await self.get_json(
                 "geckoterminal",
@@ -956,6 +976,9 @@ class SolanaTokenClient:
         fetched_at = _iso_now()
         value = parse_geckoterminal_holders(body)
         if value is None:
+            if cached is not None and cached[1].status == "ok":
+                self._holders_cache.move_to_end(mint)
+                return cached[1]
             return unavailable_fact(
                 "geckoterminal",
                 "No holder data from GeckoTerminal yet",

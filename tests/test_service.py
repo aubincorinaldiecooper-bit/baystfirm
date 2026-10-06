@@ -62,6 +62,12 @@ def test_api_key_guards_v1_routes(tmp_path: Path) -> None:
         assert client.get("/v1/solana/tokens/new").status_code == 401
         assert (
             client.get(
+                "/v1/solana/tokens/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263/price"
+            ).status_code
+            == 401
+        )
+        assert (
+            client.get(
                 "/v1/solana/tokens/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263/candles?interval=1h"
             ).status_code
             == 401
@@ -419,6 +425,152 @@ def test_candles_route_rejects_invalid_or_excessive_indicator_specs(
         params.extend(("indicator", "sma:2") for _ in range(7))
         excessive = client.get("/v1/candles", params=params)
         assert excessive.status_code == 422
+
+
+def _solana_price_pairs(mint: str) -> list[dict[str, object]]:
+    return [
+        {
+            "baseToken": {"address": mint, "symbol": "BONK"},
+            "pairAddress": "pool-main",
+            "dexId": "orca",
+            "priceUsd": "0.00002",
+            "liquidity": {"usd": 500},
+            "volume": {"h24": 125},
+            "priceChange": {"h24": -1.5},
+        }
+    ]
+
+
+def test_solana_token_price_returns_and_reuses_five_second_cache(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    mint = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+    calls: list[tuple[str, str]] = []
+
+    async def get_json(source, url, *, params=None, headers=None, priority="background"):
+        calls.append((source, url))
+        return _solana_price_pairs(mint)
+
+    app = _strategy_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        checker = app.state.runtime.solana_tokens.checker
+        monkeypatch.setattr(checker, "get_json", get_json)
+        first = client.get(f"/v1/solana/tokens/{mint}/price")
+        second = client.get(f"/v1/solana/tokens/{mint}/price")
+
+    assert first.status_code == second.status_code == 200
+    body = first.json()
+    assert body["mint"] == mint
+    assert body["source"] == "dexscreener"
+    assert body["stale"] is False
+    assert body["market"]["price_usd"] == 0.00002
+    assert body["market"]["price_change_24h_pct"] == -1.5
+    assert body["market"]["main_pool"]["address"] == "pool-main"
+    assert second.json()["market"]["price_usd"] == 0.00002
+    assert second.json()["stale"] is False
+    assert len(calls) == 1
+    assert calls[0] == (
+        "dexscreener",
+        "https://api.dexscreener.com/token-pairs/v1/solana/" + mint,
+    )
+    assert app.state.runtime.solana_pool_cache[mint][1]["pairAddress"] == "pool-main"
+
+
+def test_solana_token_price_returns_expired_value_stale_after_source_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    mint = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+    fail = False
+
+    async def get_json(source, url, *, params=None, headers=None, priority="background"):
+        if fail:
+            raise SourceError("dexscreener", "Couldn't check right now")
+        return _solana_price_pairs(mint)
+
+    app = _strategy_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        checker = app.state.runtime.solana_tokens.checker
+        monkeypatch.setattr(checker, "get_json", get_json)
+        fresh = client.get(f"/v1/solana/tokens/{mint}/price")
+        cached_at, cached_value = app.state.runtime.solana_price_cache[mint]
+        app.state.runtime.solana_price_cache[mint] = (
+            cached_at - service_module.SOLANA_PRICE_CACHE_TTL_SECONDS - 1,
+            cached_value,
+        )
+        fail = True
+        stale = client.get(f"/v1/solana/tokens/{mint}/price")
+
+    assert fresh.status_code == 200
+    assert stale.status_code == 200
+    assert stale.json()["stale"] is True
+    assert stale.json()["market"]["price_usd"] == 0.00002
+
+
+def test_solana_token_price_maps_upstream_error_and_no_pool(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    mint = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+    app = _strategy_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        checker = app.state.runtime.solana_tokens.checker
+
+        async def unavailable(source, url, *, params=None, headers=None, priority="background"):
+            raise SourceError("dexscreener", "DexScreener unavailable")
+
+        monkeypatch.setattr(checker, "get_json", unavailable)
+        uncached_error = client.get(f"/v1/solana/tokens/{mint}/price")
+
+        async def empty_pairs(source, url, *, params=None, headers=None, priority="background"):
+            return []
+
+        monkeypatch.setattr(checker, "get_json", empty_pairs)
+        no_pool = client.get(f"/v1/solana/tokens/{mint}/price")
+        invalid_mint = client.get("/v1/solana/tokens/not-a-mint/price")
+
+    assert uncached_error.status_code == 502
+    assert uncached_error.json()["detail"] == "DexScreener unavailable"
+    assert no_pool.status_code == 404
+    assert no_pool.json()["detail"] == "No trading pool found for this token"
+    assert invalid_mint.status_code == 400
+
+
+def test_solana_token_price_pool_cache_is_reused_by_candles_route(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    mint = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+    calls: list[str] = []
+    candle_body = {
+        "data": {
+            "attributes": {
+                "ohlcv_list": [[1_730_000_000, 1, 2, 0.5, 1.5, 10]],
+            }
+        }
+    }
+
+    async def get_json(source, url, *, params=None, headers=None, priority="background"):
+        calls.append(source)
+        if source == "dexscreener":
+            return _solana_price_pairs(mint)
+        return candle_body
+
+    app = _strategy_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        checker = app.state.runtime.solana_tokens.checker
+        monkeypatch.setattr(checker, "get_json", get_json)
+        price = client.get(f"/v1/solana/tokens/{mint}/price")
+        candles = client.get(
+            f"/v1/solana/tokens/{mint}/candles",
+            params={"interval": "1h", "limit": 2},
+        )
+
+    assert price.status_code == 200
+    assert candles.status_code == 200
+    assert candles.json()["pool_address"] == "pool-main"
+    assert calls == ["dexscreener", "geckoterminal"]
 
 
 def test_solana_search_groups_sorts_and_caches_casefolded_queries(

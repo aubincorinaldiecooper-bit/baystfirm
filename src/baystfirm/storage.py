@@ -25,6 +25,7 @@ ClassificationRow = tuple[
     int,
     str | None,
 ]
+PRUNE_BATCH_SIZE = 20_000
 
 
 class EventStore:
@@ -53,6 +54,12 @@ class EventStore:
             """
             CREATE INDEX IF NOT EXISTS idx_market_events_symbol_time
             ON market_events(symbol, exchange_timestamp)
+            """
+        )
+        await self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_market_events_received
+            ON market_events(received_timestamp)
             """
         )
         await self._connection.execute(
@@ -133,6 +140,33 @@ class EventStore:
         if self._connection is None:
             raise RuntimeError("event store is not open")
         return self._connection
+
+    async def _prune_timestamped_rows(
+        self, table: str, timestamp_column: str, older_than: datetime
+    ) -> int:
+        cutoff = older_than if older_than.tzinfo is not None else older_than.replace(tzinfo=UTC)
+        cutoff_text = cutoff.astimezone(UTC).isoformat()
+        total_deleted = 0
+        while True:
+            cursor = await self.connection.execute(
+                f"""
+                DELETE FROM {table}
+                WHERE rowid IN (
+                    SELECT rowid FROM {table} WHERE {timestamp_column} < ? LIMIT ?
+                )
+                """,
+                (cutoff_text, PRUNE_BATCH_SIZE),
+            )
+            batch_deleted = cursor.rowcount
+            await cursor.close()
+            await self.connection.commit()
+            total_deleted += batch_deleted
+            if batch_deleted < PRUNE_BATCH_SIZE:
+                break
+        cursor = await self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        await cursor.fetchone()
+        await cursor.close()
+        return total_deleted
 
     async def append_event(self, event: MarketEvent) -> None:
         await self.append_events([event])
@@ -221,6 +255,12 @@ class EventStore:
         row = await cursor.fetchone()
         await cursor.close()
         return int(row[0]) if row else 0
+
+    async def prune_events(self, older_than: datetime) -> int:
+        return await self._prune_timestamped_rows("market_events", "received_timestamp", older_than)
+
+    async def prune_classifications(self, older_than: datetime) -> int:
+        return await self._prune_timestamped_rows("classifications", "observed_at", older_than)
 
     async def append_news(self, item: NewsItem) -> None:
         await self.connection.execute(

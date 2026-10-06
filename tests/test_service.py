@@ -49,7 +49,6 @@ def _settings(tmp_path: Path, api_key: str | None = None) -> Settings:
         shadow_mode=True,
         symbols=("USDC-USD",),
         api_key=api_key,
-        solana_tokens_enabled=False,
     )
 
 
@@ -114,6 +113,7 @@ def test_solana_new_tokens_is_warming_before_first_cycle(tmp_path: Path) -> None
 
     assert response.status_code == 200
     body = response.json()
+    assert app.state.runtime.settings.solana_tokens_enabled is False
     assert app.state.runtime.solana_tokens_task is None
     assert body["status"] == "warming"
     assert body["updated_at"] is None
@@ -140,6 +140,32 @@ def test_solana_detail_returns_404_for_non_token_mint(tmp_path: Path) -> None:
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Address is not a token mint."
+
+
+def test_solana_detail_works_when_discovery_is_disabled(tmp_path: Path, monkeypatch) -> None:
+    class CardStub:
+        def __init__(self, mint: str) -> None:
+            self.mint = mint
+
+        def model_dump(self, *, mode: str) -> dict[str, str]:
+            assert mode == "json"
+            return {"mint": self.mint}
+
+    mint = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        runtime = app.state.runtime
+        assert runtime.solana_tokens is not None
+        assert runtime.solana_tokens_task is None
+
+        async def get_card(requested_mint: str) -> CardStub:
+            return CardStub(requested_mint)
+
+        monkeypatch.setattr(runtime.solana_tokens, "get_card", get_card)
+        response = client.get(f"/v1/solana/tokens/{mint}")
+
+    assert response.status_code == 200
+    assert response.json() == {"mint": mint}
 
 
 @pytest.mark.asyncio
@@ -216,7 +242,8 @@ def _solana_settings() -> Settings:
 def test_track_record_window_hours_validation(tmp_path: Path) -> None:
     with TestClient(create_app(_settings(tmp_path))) as client:
         assert client.get("/v1/track-record?window_hours=0").status_code == 422
-        assert client.get("/v1/track-record?window_hours=169").status_code == 422
+        assert client.get("/v1/track-record?window_hours=48").status_code == 200
+        assert client.get("/v1/track-record?window_hours=49").status_code == 422
 
 
 def test_snapshot_reports_latest_event_and_classification(tmp_path: Path) -> None:

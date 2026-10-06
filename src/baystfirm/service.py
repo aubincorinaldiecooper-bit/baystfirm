@@ -8,7 +8,7 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from time import monotonic
 from typing import Annotated, Any
 
@@ -84,6 +84,7 @@ SEED_VENUE_ORDER = ("coinbase", "kraken", "okx", "binanceus", "bybit")
 SEED_BAR_COUNT = 1500
 BACKTEST_BAR_COUNT = 10_080
 SIGNAL_BACKTEST_REFRESH_SECONDS = 6 * 60 * 60
+STORAGE_RETENTION_INTERVAL_SECONDS = 10 * 60
 BACKTEST_NOTE = (
     "Replayed on 1-minute candles from one exchange per instrument; live calls use trades merged "
     "from all venues, so results can differ. Backtests usually look better than live results. "
@@ -138,6 +139,7 @@ class Runtime:
     news_task: asyncio.Task[None] | None = None
     signal_backtest: dict[str, Any] | None = None
     signal_backtest_task: asyncio.Task[None] | None = None
+    retention_task: asyncio.Task[None] | None = None
     solana_tokens: SolanaTokenEngine | None = None
     solana_tokens_task: asyncio.Task[None] | None = None
     solana_http_client: httpx.AsyncClient | None = None
@@ -242,6 +244,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await runtime.store.open()
+        runtime.retention_task = asyncio.create_task(
+            _storage_retention_loop(runtime),
+            name="storage-retention",
+        )
         runtime.news_service = NewsService(runtime.store, runtime.settings.sec_user_agent)
         if runtime.settings.news_enabled:
             runtime.news_task = asyncio.create_task(
@@ -275,6 +281,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 runtime.seed_task,
                 runtime.news_task,
                 runtime.signal_backtest_task,
+                runtime.retention_task,
                 runtime.solana_tokens_task,
             ):
                 if task is None:
@@ -643,7 +650,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @v1.get("/track-record")
-    async def track_record(window_hours: int = Query(default=24, ge=1, le=168)) -> dict[str, Any]:
+    async def track_record(window_hours: int = Query(default=24, ge=1, le=48)) -> dict[str, Any]:
         return await runtime.track_record.get(window_hours)
 
     @v1.get("/track-record/backtest")
@@ -942,6 +949,26 @@ async def _signal_backtest_loop(
         except Exception:
             logger.exception("momentum signal backtest computation failed")
         await asyncio.sleep(SIGNAL_BACKTEST_REFRESH_SECONDS)
+
+
+async def _storage_retention_loop(runtime: Runtime) -> None:
+    while True:
+        now = datetime.now(UTC)
+        try:
+            deleted = await runtime.store.prune_events(
+                now - timedelta(hours=runtime.settings.event_retention_hours)
+            )
+            logger.info("Storage retention pruned %d market events", deleted)
+        except Exception:
+            logger.exception("Storage retention failed to prune market events")
+        try:
+            deleted = await runtime.store.prune_classifications(
+                now - timedelta(days=runtime.settings.classification_retention_days)
+            )
+            logger.info("Storage retention pruned %d classifications", deleted)
+        except Exception:
+            logger.exception("Storage retention failed to prune classifications")
+        await asyncio.sleep(STORAGE_RETENTION_INTERVAL_SECONDS)
 
 
 async def _solana_discovery_cycle(engine: SolanaTokenEngine) -> None:

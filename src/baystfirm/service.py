@@ -63,6 +63,7 @@ from baystfirm.solana_tokens import (
     SolanaTokenClient,
     SolanaTokenEngine,
     SourceError,
+    market_value,
     select_main_pool,
     validate_mint,
 )
@@ -97,6 +98,8 @@ SOLANA_TOKEN_REFRESH_SECONDS = 60
 SOLANA_TOKEN_WORKERS = 4
 SOLANA_SEARCH_CACHE_TTL_SECONDS = 30
 SOLANA_SEARCH_CACHE_MAX_ENTRIES = 256
+SOLANA_PRICE_CACHE_TTL_SECONDS = 5
+SOLANA_PRICE_CACHE_MAX_ENTRIES = 256
 SOLANA_POOL_CACHE_TTL_SECONDS = 5 * 60
 SOLANA_POOL_CACHE_MAX_ENTRIES = 256
 SOLANA_CANDLE_CACHE_TTL_SECONDS = 60
@@ -147,6 +150,9 @@ class Runtime:
         default_factory=OrderedDict
     )
     solana_pool_cache: OrderedDict[str, tuple[float, dict[str, Any] | None]] = field(
+        default_factory=OrderedDict
+    )
+    solana_price_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = field(
         default_factory=OrderedDict
     )
     solana_candle_cache: OrderedDict[tuple[str, str, int], tuple[float, dict[str, Any]]] = field(
@@ -719,6 +725,58 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "note": SOLANA_TOKENS_NOTE,
             }
         return {**engine.response(limit), "note": SOLANA_TOKENS_NOTE}
+
+    @v1.get("/solana/tokens/{mint}/price")
+    async def solana_token_price(mint: str) -> dict[str, Any]:
+        try:
+            validate_mint(mint)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+        cached = runtime.solana_price_cache.get(mint)
+        now = monotonic()
+        if cached is not None and now - cached[0] < SOLANA_PRICE_CACHE_TTL_SECONDS:
+            runtime.solana_price_cache.move_to_end(mint)
+            result = dict(cached[1])
+            result["stale"] = False
+            return result
+
+        try:
+            pairs = await solana_checker().get_token_pairs(mint)
+        except SourceError as error:
+            if cached is None:
+                raise HTTPException(status_code=502, detail=error.detail) from error
+            runtime.solana_price_cache.move_to_end(mint)
+            result = dict(cached[1])
+            result["stale"] = True
+            return result
+
+        main = select_main_pool(pairs)
+        if main is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No trading pool found for this token",
+            )
+
+        fetched_at = datetime.now(UTC).isoformat()
+        result = {
+            "mint": mint,
+            "source": "dexscreener",
+            "fetched_at": fetched_at,
+            "stale": False,
+            "market": market_value(pairs, pools_checked_at=fetched_at),
+        }
+        cached_at = monotonic()
+        runtime.solana_price_cache[mint] = (cached_at, result)
+        runtime.solana_price_cache.move_to_end(mint)
+        while len(runtime.solana_price_cache) > SOLANA_PRICE_CACHE_MAX_ENTRIES:
+            runtime.solana_price_cache.popitem(last=False)
+
+        runtime.solana_pool_cache[mint] = (cached_at, main)
+        runtime.solana_pool_cache.move_to_end(mint)
+        while len(runtime.solana_pool_cache) > SOLANA_POOL_CACHE_MAX_ENTRIES:
+            runtime.solana_pool_cache.popitem(last=False)
+        return result
 
     @v1.get("/solana/tokens/{mint}/candles")
     async def solana_token_candles(

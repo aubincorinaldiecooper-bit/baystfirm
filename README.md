@@ -181,7 +181,9 @@ results describe pools found by the search and do not imply endorsement. The tok
 `GET /v1/solana/tokens/{mint}/candles?interval=1h&limit=300` for USD GeckoTerminal candles at
 `1m`, `5m`, `15m`, `1h`, `4h`, or `1d` intervals, with the same repeated indicator specs as
 `/v1/candles`.
-The feed refreshes every 60 seconds, keeps at most 200 tokens, and loads cards in the background.
+Background discovery is off by default. When enabled with `BAYST_SOLANA_TOKENS=true`, the feed
+refreshes every 60 seconds, keeps at most 200 tokens, and loads cards in the background. Search,
+detail, and candle routes remain available on demand.
 Cards show sourced, timestamped facts from standard Solana JSON-RPC calls, DEX Screener,
 GeckoTerminal, and the Raydium pool API. `top10_share` uses GeckoTerminal's token-info holder
 distribution by default; it may include pool and exchange accounts, which GeckoTerminal does not
@@ -190,7 +192,8 @@ GeckoTerminal. Feed card builds skip the optional GeckoTerminal liquidity cross-
 detail cards retain it. RPC is limited to 4 requests/s (largest-account requests, when a custom RPC
 is used, to 1 per 2 seconds); DEX Screener to 4/s; the keyless GeckoTerminal API is budgeted at
 approximately 10 calls/minute with a shared token bucket. Background discovery and holder work
-leave a three-token reserve for interactive detail and candle requests. GeckoTerminal 429 responses
+leave a three-token reserve for interactive detail and candle requests when discovery is enabled;
+with discovery off, the budget is available to on-demand requests. GeckoTerminal 429 responses
 pause shared callers with Retry-After or exponential backoff; interactive calls wait at most five
 seconds for a token. Raydium is limited to 2/s and RugCheck to 1/s.
 Market facts include the selected main pool's price/liquidity/volume plus all-pool count, total
@@ -200,7 +203,8 @@ Our on-chain checks are presented first. RugCheck is explicitly a second opinion
 not issue an overall safe/unsafe verdict and does not provide wallets or trade execution. The RPC
 provider can be changed with `BAYST_SOLANA_RPC_URL`; its full URL is never logged or returned
 because provider URLs may contain credentials. Set `BAYST_RUGCHECK_API_KEY` to send RugCheck's
-optional `X-API-KEY` header. `BAYST_SOLANA_TOKENS=false` disables the background discovery loop.
+optional `X-API-KEY` header. Solana discovery is off by default; set `BAYST_SOLANA_TOKENS=true`
+to enable it.
 
 ## News and events
 
@@ -224,11 +228,19 @@ These are measured facts, not investment advice or an overall safety verdict.
 Set `BAYST_NEWS=false` to disable the official-feed poller. All news requests use
 `BAYST_SEC_USER_AGENT`, which should identify the application and provide a contact email.
 
+## Storage retention
+
+Market events are retained for 3 hours and classifications for 3 days by default. Set
+`BAYST_EVENT_RETENTION_HOURS` or `BAYST_CLASSIFICATION_RETENTION_DAYS` to change these positive
+limits; pruning runs every 10 minutes.
+
 ## Configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `BAYST_DATABASE_PATH` | `var/baystfirm.db` | SQLite event and classification store |
+| `BAYST_EVENT_RETENTION_HOURS` | `3.0` | Retain market events for this many hours; must be positive |
+| `BAYST_CLASSIFICATION_RETENTION_DAYS` | `3.0` | Retain classifications for this many days; must be positive |
 | `BAYST_VENUES` | `coinbase,kraken,bybit,okx` | Public stream adapters to run |
 | `BAYST_SYMBOLS` | Majors, stablecoins, and perpetuals | Canonical instruments; each venue subscribes to the ones it lists |
 | `BAYST_SHADOW_MODE` | `true` | Prevent unvalidated classifications from becoming trusted |
@@ -237,7 +249,7 @@ Set `BAYST_NEWS=false` to disable the official-feed poller. All news requests us
 | `BAYST_SEC_USER_AGENT` | `Baystfirm/0.1 aubincorinaldiecooper@gmail.com` | Declared User-Agent for news and SEC requests |
 | `BAYST_SOLANA_RPC_URL` | `https://api.mainnet-beta.solana.com` | Swappable standard JSON-RPC endpoint; never logged or returned |
 | `BAYST_RUGCHECK_API_KEY` | _(empty)_ | Optional RugCheck API key, sent as `X-API-KEY` |
-| `BAYST_SOLANA_TOKENS` | `true` | Enable the background Solana token discovery loop |
+| `BAYST_SOLANA_TOKENS` | `false` | Enable the background Solana token discovery loop |
 
 ## Implemented foundation
 

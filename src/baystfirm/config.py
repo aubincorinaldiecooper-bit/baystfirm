@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,9 +40,20 @@ class Settings:
     api_key: str | None = None
     solana_rpc_url: str = DEFAULT_SOLANA_RPC_URL
     rugcheck_api_key: str | None = None
-    solana_tokens_enabled: bool = True
+    solana_tokens_enabled: bool = False
+    event_retention_hours: float = 3.0
+    classification_retention_days: float = 3.0
     news_enabled: bool = True
     sec_user_agent: str = "Baystfirm/0.1 aubincorinaldiecooper@gmail.com"
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.event_retention_hours) or self.event_retention_hours <= 0:
+            raise ValueError("event_retention_hours must be greater than 0")
+        if (
+            not math.isfinite(self.classification_retention_days)
+            or self.classification_retention_days <= 0
+        ):
+            raise ValueError("classification_retention_days must be greater than 0")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -63,8 +75,12 @@ class Settings:
             api_key=os.getenv("BAYST_API_KEY", "").strip() or None,
             solana_rpc_url=os.getenv("BAYST_SOLANA_RPC_URL", DEFAULT_SOLANA_RPC_URL),
             rugcheck_api_key=os.getenv("BAYST_RUGCHECK_API_KEY", "").strip() or None,
-            solana_tokens_enabled=os.getenv("BAYST_SOLANA_TOKENS", "true").lower()
+            solana_tokens_enabled=os.getenv("BAYST_SOLANA_TOKENS", "false").lower()
             not in {"0", "false", "no"},
+            event_retention_hours=float(os.getenv("BAYST_EVENT_RETENTION_HOURS", "3.0")),
+            classification_retention_days=float(
+                os.getenv("BAYST_CLASSIFICATION_RETENTION_DAYS", "3.0")
+            ),
             news_enabled=os.getenv("BAYST_NEWS", "true").lower() not in {"0", "false", "no"},
             sec_user_agent=os.getenv(
                 "BAYST_SEC_USER_AGENT",

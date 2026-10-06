@@ -82,10 +82,14 @@ def test_solana_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.delenv("BAYST_SOLANA_RPC_URL", raising=False)
     monkeypatch.delenv("BAYST_RUGCHECK_API_KEY", raising=False)
     monkeypatch.delenv("BAYST_SOLANA_TOKENS", raising=False)
+    monkeypatch.delenv("BAYST_EVENT_RETENTION_HOURS", raising=False)
+    monkeypatch.delenv("BAYST_CLASSIFICATION_RETENTION_DAYS", raising=False)
     defaults = Settings.from_env()
     assert defaults.solana_rpc_url == "https://api.mainnet-beta.solana.com"
     assert defaults.rugcheck_api_key is None
-    assert defaults.solana_tokens_enabled is True
+    assert defaults.solana_tokens_enabled is False
+    assert defaults.event_retention_hours == 3.0
+    assert defaults.classification_retention_days == 3.0
 
     monkeypatch.setenv("BAYST_SOLANA_RPC_URL", "https://rpc.example.invalid/key")
     monkeypatch.setenv("BAYST_RUGCHECK_API_KEY", "rugcheck-secret")
@@ -94,6 +98,38 @@ def test_solana_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) 
     assert configured.solana_rpc_url == "https://rpc.example.invalid/key"
     assert configured.rugcheck_api_key == "rugcheck-secret"
     assert configured.solana_tokens_enabled is False
+
+
+def test_retention_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BAYST_EVENT_RETENTION_HOURS", "1.5")
+    monkeypatch.setenv("BAYST_CLASSIFICATION_RETENTION_DAYS", "4.25")
+
+    settings = Settings.from_env()
+
+    assert settings.event_retention_hours == 1.5
+    assert settings.classification_retention_days == 4.25
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("BAYST_EVENT_RETENTION_HOURS", "0"),
+        ("BAYST_EVENT_RETENTION_HOURS", "-1"),
+        ("BAYST_CLASSIFICATION_RETENTION_DAYS", "0"),
+        ("BAYST_CLASSIFICATION_RETENTION_DAYS", "-1"),
+    ],
+)
+def test_retention_settings_reject_non_positive_values(
+    monkeypatch: pytest.MonkeyPatch,
+    variable: str,
+    value: str,
+) -> None:
+    monkeypatch.delenv("BAYST_EVENT_RETENTION_HOURS", raising=False)
+    monkeypatch.delenv("BAYST_CLASSIFICATION_RETENTION_DAYS", raising=False)
+    monkeypatch.setenv(variable, value)
+
+    with pytest.raises(ValueError, match="must be greater than 0"):
+        Settings.from_env()
 
 
 def test_validate_mint_and_metadata_pda_use_solders_pubkeys() -> None:

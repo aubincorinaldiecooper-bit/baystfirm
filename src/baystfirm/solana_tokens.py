@@ -71,6 +71,8 @@ GECKOTERMINAL_BACKGROUND_RESERVE = 3.0
 GECKOTERMINAL_INTERACTIVE_TIMEOUT_SECONDS = 5.0
 GECKOTERMINAL_INITIAL_BACKOFF_SECONDS = 60.0
 GECKOTERMINAL_MAX_BACKOFF_SECONDS = 600.0
+GECKOTERMINAL_HOLDERS_CACHE_TTL_SECONDS = 3600.0
+GECKOTERMINAL_HOLDERS_CACHE_MAX_ENTRIES = 256
 DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/tokens/v1/solana"
 DEXSCREENER_TOKEN_PAIRS_URL = "https://api.dexscreener.com/token-pairs/v1/solana"
 DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
@@ -557,6 +559,7 @@ class SolanaTokenClient:
         self._gecko_bucket = gecko_bucket or GeckoTerminalTokenBucket()
         self.sources = {source: _source_status(source) for source in SOURCE_NAMES}
         self._request_id = 0
+        self._holders_cache: OrderedDict[str, tuple[float, Fact]] = OrderedDict()
 
     async def rpc(self, method: str, params: list[Any], *, largest: bool = False) -> Any:
         limiter_name = "solana_largest" if largest else "solana_rpc"
@@ -929,6 +932,12 @@ class SolanaTokenClient:
         *,
         priority: Literal["background", "interactive"] = "background",
     ) -> Fact:
+        cached = self._holders_cache.get(mint)
+        if cached is not None:
+            cached_at, cached_fact = cached
+            if monotonic() - cached_at < GECKOTERMINAL_HOLDERS_CACHE_TTL_SECONDS:
+                self._holders_cache.move_to_end(mint)
+                return cached_fact
         try:
             body = await self.get_json(
                 "geckoterminal",
@@ -936,6 +945,9 @@ class SolanaTokenClient:
                 priority=priority,
             )
         except SourceError as error:
+            if cached is not None and cached[1].status == "ok":
+                self._holders_cache.move_to_end(mint)
+                return cached[1]
             return unavailable_fact(
                 "geckoterminal",
                 error.detail,
@@ -949,13 +961,18 @@ class SolanaTokenClient:
                 "No holder data from GeckoTerminal yet",
                 fetched_at=fetched_at,
             )
-        return Fact(
+        fact = Fact(
             status="ok",
             value=value,
             source="geckoterminal",
             fetched_at=fetched_at,
             detail="Top 10 holders per GeckoTerminal; may include pool and exchange accounts",
         )
+        self._holders_cache[mint] = (monotonic(), fact)
+        self._holders_cache.move_to_end(mint)
+        while len(self._holders_cache) > GECKOTERMINAL_HOLDERS_CACHE_MAX_ENTRIES:
+            self._holders_cache.popitem(last=False)
+        return fact
 
     async def rugcheck(self, mint: str) -> SecondOpinion:
         headers = (
@@ -1784,7 +1801,7 @@ class SolanaTokenEngine:
         card = await self.build_card(
             mint,
             first_seen_at=existing.first_seen_at if existing is not None else None,
-            gecko_cross_check=True,
+            gecko_cross_check=False,
             fetch_rugcheck=fetch_rugcheck,
             geckoterminal_priority="interactive",
         )

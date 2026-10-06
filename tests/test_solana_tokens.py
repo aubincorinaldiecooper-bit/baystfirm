@@ -621,6 +621,91 @@ def test_main_pool_uses_highest_liquidity_and_missing_liquidity_is_zero() -> Non
     assert value["pools_checked_at"] == "2026-10-04T00:00:00+00:00"
 
 
+def test_main_pool_selects_liquid_price_consistent_pool_for_bonk() -> None:
+    pairs = [
+        {
+            "dexId": "meteora",
+            "pairAddress": "broken-bonk-useless",
+            "priceUsd": "0.0622",
+            "liquidity": {"usd": 2_092_466},
+            "volume": {"h24": 4_694},
+        },
+        {
+            "dexId": "orca",
+            "pairAddress": "bonk-sol",
+            "priceUsd": "0.000003757",
+            "liquidity": {"usd": 425_665},
+            "volume": {"h24": 457_415},
+        },
+        {
+            "dexId": "meteora",
+            "pairAddress": "bonk-usdc",
+            "priceUsd": "0.000003757",
+            "liquidity": {"usd": 267_604},
+            "volume": {"h24": 0},
+        },
+        {
+            "dexId": "raydium",
+            "pairAddress": "bonk-usdc-raydium",
+            "priceUsd": "0.000003754",
+            "liquidity": {"usd": 200_823},
+            "volume": {"h24": 212_853},
+        },
+    ]
+
+    assert select_main_pool(pairs) is pairs[1]
+    value = market_value(pairs)
+    assert value is not None
+    assert value["price_usd"] == 0.000003757
+
+
+def test_main_pool_selects_the_only_pair_with_a_usable_price() -> None:
+    pair = {"priceUsd": "0.000003757", "liquidity": {"usd": 100}}
+
+    assert select_main_pool([pair]) is pair
+
+
+def test_main_pool_uses_lower_plain_median_when_volumes_are_zero() -> None:
+    pairs = [
+        {
+            "pairAddress": "lower",
+            "priceUsd": "1.0",
+            "liquidity": {"usd": 100},
+            "volume": {"h24": 0},
+        },
+        {
+            "pairAddress": "lower-middle",
+            "priceUsd": "1.1",
+            "liquidity": {"usd": 50},
+            "volume": {"h24": 0},
+        },
+        {
+            "pairAddress": "upper-middle",
+            "priceUsd": "1.222",
+            "liquidity": {"usd": 999},
+            "volume": {"h24": 0},
+        },
+        {
+            "pairAddress": "outlier",
+            "priceUsd": "10.0",
+            "liquidity": {"usd": 2_000},
+            "volume": {"h24": 0},
+        },
+    ]
+
+    assert select_main_pool(pairs) is pairs[0]
+
+
+def test_main_pool_falls_back_to_highest_liquidity_when_prices_are_missing() -> None:
+    pairs = [
+        {"pairAddress": "missing", "liquidity": {"usd": 100}},
+        {"pairAddress": "invalid", "priceUsd": "not-a-price", "liquidity": {"usd": 500}},
+        {"pairAddress": "zero", "priceUsd": "0", "liquidity": {"usd": 10}},
+    ]
+
+    assert select_main_pool(pairs) is pairs[1]
+
+
 @pytest.mark.asyncio
 async def test_raydium_burn_percent_populates_liquidity_lock() -> None:
     requests: list[httpx.Request] = []

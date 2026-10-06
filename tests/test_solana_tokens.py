@@ -78,6 +78,25 @@ def _settings(
     )
 
 
+def _geckoterminal_holder_response(top_10: str = "38.4623") -> dict[str, Any]:
+    return {
+        "data": {
+            "attributes": {
+                "holders": {
+                    "count": 1_024_405,
+                    "distribution_percentage": {
+                        "top_10": top_10,
+                        "11_20": "8.1",
+                        "21_40": "7.2",
+                        "rest": "46.2",
+                    },
+                    "last_updated": "2026-10-04T21:10:00Z",
+                }
+            }
+        }
+    }
+
+
 def test_solana_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("BAYST_SOLANA_RPC_URL", raising=False)
     monkeypatch.delenv("BAYST_RUGCHECK_API_KEY", raising=False)
@@ -869,6 +888,116 @@ async def test_geckoterminal_null_holders_returns_unavailable() -> None:
 
 
 @pytest.mark.asyncio
+async def test_geckoterminal_holders_are_cached_until_one_hour_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(solana_module, "monotonic", clock.time)
+    request_count = 0
+
+    async def get_json(
+        source: str,
+        url: str,
+        *,
+        priority: str = "background",
+    ) -> dict[str, Any]:
+        nonlocal request_count
+        assert source == "geckoterminal"
+        assert url.endswith(f"/tokens/{MINT}/info")
+        assert priority == "background"
+        request_count += 1
+        return _geckoterminal_holder_response(str(request_count))
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(404))
+    ) as http:
+        checker = SolanaTokenClient(_settings(), http, rate_limits=RATE_LIMITS_OFF)
+        monkeypatch.setattr(checker, "get_json", get_json)
+
+        first = await checker.geckoterminal_top10_share(MINT)
+        clock.advance(solana_module.GECKOTERMINAL_HOLDERS_CACHE_TTL_SECONDS - 1)
+        second = await checker.geckoterminal_top10_share(MINT)
+        clock.advance(2)
+        third = await checker.geckoterminal_top10_share(MINT)
+
+    assert request_count == 2
+    assert second is first
+    assert second.fetched_at == first.fetched_at
+    assert third.value["pct"] == 2.0
+
+
+@pytest.mark.asyncio
+async def test_expired_geckoterminal_holder_cache_falls_back_on_source_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(solana_module, "monotonic", clock.time)
+    request_count = 0
+
+    async def get_json(
+        source: str,
+        url: str,
+        *,
+        priority: str = "background",
+    ) -> dict[str, Any]:
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            return _geckoterminal_holder_response()
+        raise SourceError("geckoterminal", "temporarily unavailable")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(404))
+    ) as http:
+        checker = SolanaTokenClient(_settings(), http, rate_limits=RATE_LIMITS_OFF)
+        monkeypatch.setattr(checker, "get_json", get_json)
+
+        first = await checker.geckoterminal_top10_share(MINT)
+        clock.advance(solana_module.GECKOTERMINAL_HOLDERS_CACHE_TTL_SECONDS + 1)
+        second = await checker.geckoterminal_top10_share(MINT)
+
+    assert request_count == 2
+    assert second is first
+    assert second.fetched_at == first.fetched_at
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_result", ["error", "no_data"])
+async def test_unavailable_geckoterminal_holder_results_are_not_cached(
+    monkeypatch: pytest.MonkeyPatch,
+    first_result: str,
+) -> None:
+    request_count = 0
+
+    async def get_json(
+        source: str,
+        url: str,
+        *,
+        priority: str = "background",
+    ) -> dict[str, Any]:
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            if first_result == "error":
+                raise SourceError("geckoterminal", "upstream unavailable")
+            return {"data": {"attributes": {"holders": None}}}
+        return _geckoterminal_holder_response("12.5")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(404))
+    ) as http:
+        checker = SolanaTokenClient(_settings(), http, rate_limits=RATE_LIMITS_OFF)
+        monkeypatch.setattr(checker, "get_json", get_json)
+
+        first = await checker.geckoterminal_top10_share(MINT)
+        second = await checker.geckoterminal_top10_share(MINT)
+
+    assert request_count == 2
+    assert first.status == "unavailable"
+    assert second.status == "ok"
+
+
+@pytest.mark.asyncio
 async def test_custom_rpc_429_falls_back_to_geckoterminal() -> None:
     rpc_methods: list[str] = []
 
@@ -972,7 +1101,7 @@ async def test_feed_card_queues_holder_lookup_without_liquidity_cross_check(
         }
     ]
     await engine.get_card(MINT)
-    assert calls[-1]["gecko_cross_check"] is True
+    assert calls[-1]["gecko_cross_check"] is False
     assert calls[-1]["geckoterminal_priority"] == "interactive"
     detail_call_count = len(calls)
     await engine.get_card(MINT)
@@ -1148,7 +1277,10 @@ async def test_card_worker_does_not_overwrite_detail_card_built_during_rebuild()
 
 @pytest.mark.asyncio
 async def test_rugcheck_failure_does_not_hide_other_card_facts() -> None:
+    requests: list[httpx.Request] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         if request.url.host == "rpc.example.invalid":
             payload = json.loads(request.read())
             method = payload["method"]
@@ -1197,7 +1329,7 @@ async def test_rugcheck_failure_does_not_hide_other_card_facts() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         checker = SolanaTokenClient(_settings(), http, rate_limits=RATE_LIMITS_OFF)
         engine = SolanaTokenEngine(checker)
-        card = await engine.build_card(MINT)
+        card = await engine.get_card(MINT)
 
     assert card.name == "Bonk"
     assert card.symbol == "BONK"
@@ -1208,7 +1340,12 @@ async def test_rugcheck_failure_does_not_hide_other_card_facts() -> None:
     assert card.facts.metadata_mutable.status == "unavailable"
     assert card.facts.metadata_mutable.detail == "No metadata account"
     assert card.facts.market.status == "ok"
-    assert card.facts.market.value["geckoterminal_liquidity_usd"] == 1200
+    assert card.facts.market.value["geckoterminal_liquidity_usd"] is None
+    gecko_requests = [
+        request for request in requests if request.url.host == "api.geckoterminal.com"
+    ]
+    assert len(gecko_requests) == 1
+    assert gecko_requests[0].url.path.endswith(f"/tokens/{MINT}/info")
     assert card.facts.liquidity_lock.status == "not_applicable"
     assert card.second_opinion.status == "unavailable"
 
@@ -1308,6 +1445,7 @@ async def test_full_card_uses_all_pools_for_market_and_holder_classification() -
     assert market["total_liquidity_usd"] == 700
     assert market["total_volume_24h_usd"] == 70
     assert market["pools_checked_at"]
+    assert market["geckoterminal_liquidity_usd"] == 390
     assert card.facts.liquidity_lock.value["pool"] == "pool-b"
     assert card.facts.top10_share.value["pct"] == 10.0
     assert card.facts.top10_share.value["holders"] == [

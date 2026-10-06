@@ -46,6 +46,14 @@ from baystfirm.hub import EventHub
 from baystfirm.indicators import IndicatorSpec, compute_indicator, parse_indicator
 from baystfirm.ingestion import IngestionSupervisor
 from baystfirm.models import Candle
+from baystfirm.news import (
+    NEWS_NOTE,
+    MarketNewsObserver,
+    NewsKind,
+    NewsService,
+    normalize_news_symbol,
+    parse_tickers,
+)
 from baystfirm.pipeline import IntelligencePipeline
 from baystfirm.regime import MomentumRegimeClassifier
 from baystfirm.signal_backtest import replay_momentum
@@ -126,6 +134,8 @@ class Runtime:
         default_factory=dict
     )
     seed_task: asyncio.Task[None] | None = None
+    news_service: NewsService | None = None
+    news_task: asyncio.Task[None] | None = None
     signal_backtest: dict[str, Any] | None = None
     signal_backtest_task: asyncio.Task[None] | None = None
     solana_tokens: SolanaTokenEngine | None = None
@@ -217,6 +227,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             MarketStateClassifier(shadow=resolved.shadow_mode),
             momentum_classifier,
         ),
+        news=MarketNewsObserver(),
     )
     runtime = Runtime(
         settings=resolved,
@@ -231,6 +242,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await runtime.store.open()
+        runtime.news_service = NewsService(runtime.store, runtime.settings.sec_user_agent)
+        if runtime.settings.news_enabled:
+            runtime.news_task = asyncio.create_task(
+                runtime.news_service.poll_official_forever(),
+                name="official-news-poller",
+            )
         runtime.seed_task = asyncio.create_task(
             _seed_minute_bars(runtime.settings, runtime.momentum_classifier),
             name="seed-momentum-minute-bars",
@@ -241,7 +258,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         runtime.solana_http_client = httpx.AsyncClient(timeout=10.0)
         runtime.solana_tokens = SolanaTokenEngine(
-            SolanaTokenClient(runtime.settings, runtime.solana_http_client)
+            SolanaTokenClient(runtime.settings, runtime.solana_http_client),
+            news_sink=runtime.store.append_news,
         )
         if runtime.settings.solana_tokens_enabled:
             runtime.solana_tokens_task = asyncio.create_task(
@@ -255,6 +273,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await runtime.ingestion.stop()
             for task in (
                 runtime.seed_task,
+                runtime.news_task,
                 runtime.signal_backtest_task,
                 runtime.solana_tokens_task,
             ):
@@ -267,6 +286,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     pass
             if runtime.solana_http_client is not None:
                 await runtime.solana_http_client.aclose()
+            if runtime.news_service is not None:
+                await runtime.news_service.close()
             await runtime.store.close()
 
     app = FastAPI(
@@ -536,6 +557,57 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             async for event in runtime.store.iter_events(symbol=symbol, limit=limit)
         ]
 
+    @v1.get("/news")
+    async def news(
+        symbol: str | None = None,
+        kind: Annotated[list[NewsKind] | None, Query()] = None,
+        limit: int = Query(default=50, ge=1, le=200),
+    ) -> dict[str, Any]:
+        items = await runtime.store.iter_news(
+            symbol=normalize_news_symbol(symbol),
+            kinds=set(kind) if kind is not None else None,
+            limit=limit,
+        )
+        return {
+            "generated_at": datetime.now(UTC).isoformat(),
+            "items": [item.model_dump(mode="json") for item in items],
+            "sources": runtime.news_service.official_sources() if runtime.news_service else [],
+            "note": NEWS_NOTE,
+        }
+
+    @v1.get("/news/filings")
+    async def news_filings(
+        tickers: str = Query(min_length=1),
+        limit: int = Query(default=20, ge=1, le=50),
+    ) -> dict[str, Any]:
+        try:
+            requested = parse_tickers(tickers)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        filings: dict[str, Any] = {}
+        notes: list[str] = []
+        if runtime.news_service is not None:
+            for ticker in requested:
+                ticker_items, ticker_note = await runtime.news_service.filings_for_ticker(
+                    ticker, limit
+                )
+                for item in ticker_items:
+                    filings[item.id] = item
+                if ticker_note is not None:
+                    notes.append(ticker_note)
+        ordered = sorted(
+            filings.values(),
+            key=lambda item: item.published_at,
+            reverse=True,
+        )[:limit]
+        return {
+            "generated_at": datetime.now(UTC).isoformat(),
+            "items": [item.model_dump(mode="json") for item in ordered],
+            "notes": notes,
+            "source": runtime.news_service.sec_source() if runtime.news_service else {},
+            "note": NEWS_NOTE,
+        }
+
     @v1.get("/classifications")
     async def classifications(
         symbol: str | None = None,
@@ -754,7 +826,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(status_code=404, detail=str(error)) from error
         else:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                on_demand = SolanaTokenEngine(SolanaTokenClient(runtime.settings, client))
+                on_demand = SolanaTokenEngine(
+                    SolanaTokenClient(runtime.settings, client),
+                    news_sink=runtime.store.append_news,
+                )
                 try:
                     card = await on_demand.get_card(mint)
                 except NotTokenMint as error:

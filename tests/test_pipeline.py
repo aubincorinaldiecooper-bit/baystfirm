@@ -100,3 +100,23 @@ def test_default_classifier_order_keeps_existing_rules_first() -> None:
         "MarketStateClassifier",
         "MomentumRegimeClassifier",
     ]
+
+
+def test_raising_news_observer_does_not_break_ingestion() -> None:
+    class RaisingObserver:
+        def observe(self, event: MarketEvent) -> list[Any]:
+            del event
+            raise RuntimeError("news observer failure")
+
+    async def ingest() -> IntelligencePipeline:
+        pipeline = IntelligencePipeline(
+            StoreStub(),
+            HubStub(),
+            [],
+            news=RaisingObserver(),
+        )
+        await pipeline.ingest(market_event(EventType.TRADE))
+        return pipeline
+
+    pipeline = asyncio.run(ingest())
+    assert len(pipeline.latest_events) == 1

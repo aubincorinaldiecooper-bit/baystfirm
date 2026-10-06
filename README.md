@@ -202,6 +202,28 @@ provider can be changed with `BAYST_SOLANA_RPC_URL`; its full URL is never logge
 because provider URLs may contain credentials. Set `BAYST_RUGCHECK_API_KEY` to send RugCheck's
 optional `X-API-KEY` header. `BAYST_SOLANA_TOKENS=false` disables the background discovery loop.
 
+## News and events
+
+Authenticated `GET /v1/news` aggregates headline, source, publication time, and the original link
+from the U.S. SEC, U.S. CFTC, Federal Reserve, and Bank of Canada press-release feeds. Each feed is
+polled sequentially every 15 minutes with a 10-second timeout; individual feed failures are
+reported without stopping the others. `GET /v1/news/filings?tickers=AAPL,GOOG` fetches recent SEC
+EDGAR filings on demand. Official releases and filings link to their publisher; article bodies are
+not copied or stored.
+
+Baystfirm also reports measured events from its own data: liquidations of at least $250,000, or
+rolling five-minute liquidation totals of at least $1,000,000, with 30-minute per-rule cooldowns;
+stablecoin prices at least 0.5% from $1 across three or more trades in two minutes; and Solana
+tokens first seen within 24 hours with at least $50,000 liquidity. A same-pool Solana liquidity drop
+is reported when liquidity falls by at least half from $10,000 or more, at most once per token per
+six hours. Stablecoin events re-arm after ten calm minutes within 0.2% of $1 and at least one hour
+between alerts. Each stablecoin alert includes the median for every venue with at least three
+recent trades, the cross-market median, and the number of venues deviating in the same direction.
+These are measured facts, not investment advice or an overall safety verdict.
+
+Set `BAYST_NEWS=false` to disable the official-feed poller. All news requests use
+`BAYST_SEC_USER_AGENT`, which should identify the application and provide a contact email.
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -211,6 +233,8 @@ optional `X-API-KEY` header. `BAYST_SOLANA_TOKENS=false` disables the background
 | `BAYST_SYMBOLS` | Majors, stablecoins, and perpetuals | Canonical instruments; each venue subscribes to the ones it lists |
 | `BAYST_SHADOW_MODE` | `true` | Prevent unvalidated classifications from becoming trusted |
 | `BAYST_API_KEY` | _(empty)_ | When set, every `/v1` route requires `Authorization: Bearer <key>` (`/health` stays open) |
+| `BAYST_NEWS` | `true` | Enable the official press-release feed poller |
+| `BAYST_SEC_USER_AGENT` | `Baystfirm/0.1 aubincorinaldiecooper@gmail.com` | Declared User-Agent for news and SEC requests |
 | `BAYST_SOLANA_RPC_URL` | `https://api.mainnet-beta.solana.com` | Swappable standard JSON-RPC endpoint; never logged or returned |
 | `BAYST_RUGCHECK_API_KEY` | _(empty)_ | Optional RugCheck API key, sent as `X-API-KEY` |
 | `BAYST_SOLANA_TOKENS` | `true` | Enable the background Solana token discovery loop |

@@ -10,6 +10,7 @@ from uuid import uuid4
 import aiosqlite
 
 from baystfirm.models import Candle, Classification, MarketEvent
+from baystfirm.news import NewsItem
 
 ClassificationRow = tuple[
     str,
@@ -100,6 +101,24 @@ class EventStore:
                 fetched_at TEXT NOT NULL,
                 PRIMARY KEY (venue, symbol, interval, open_time)
             )
+            """
+        )
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS news_items (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                source TEXT NOT NULL,
+                published_at TEXT NOT NULL,
+                symbols TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        await self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_news_items_published_at
+            ON news_items(published_at)
             """
         )
         await self._connection.commit()
@@ -202,6 +221,65 @@ class EventStore:
         row = await cursor.fetchone()
         await cursor.close()
         return int(row[0]) if row else 0
+
+    async def append_news(self, item: NewsItem) -> None:
+        await self.connection.execute(
+            """
+            INSERT OR IGNORE INTO news_items (
+                id, kind, source, published_at, symbols, payload
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item.id,
+                item.kind,
+                item.source,
+                item.published_at.isoformat(),
+                json.dumps(item.symbols),
+                item.model_dump_json(),
+            ),
+        )
+        await self.connection.commit()
+
+    async def iter_news(
+        self,
+        *,
+        symbol: str | None = None,
+        kinds: set[str] | None = None,
+        limit: int = 50,
+    ) -> list[NewsItem]:
+        if kinds is not None and not kinds:
+            return []
+        clauses: list[str] = []
+        parameters: list[str | int] = []
+        if symbol is not None:
+            clauses.append(
+                "EXISTS (SELECT 1 FROM json_each(news_items.symbols) "
+                "WHERE json_each.value = ? COLLATE BINARY)"
+            )
+            parameters.append(symbol)
+        if kinds is not None:
+            placeholders = ", ".join("?" for _ in kinds)
+            clauses.append(f"kind IN ({placeholders})")
+            parameters.extend(sorted(kinds))
+        query = "SELECT payload FROM news_items"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY published_at DESC, id DESC LIMIT ?"
+        parameters.append(limit)
+        cursor = await self.connection.execute(query, parameters)
+        items: list[NewsItem] = []
+        async for row in cursor:
+            items.append(NewsItem.model_validate_json(row[0]))
+        await cursor.close()
+        return items
+
+    async def prune_news(self, older_than: datetime) -> None:
+        cutoff = older_than if older_than.tzinfo is not None else older_than.replace(tzinfo=UTC)
+        await self.connection.execute(
+            "DELETE FROM news_items WHERE published_at < ?",
+            (cutoff.astimezone(UTC).isoformat(),),
+        )
+        await self.connection.commit()
 
     async def iter_classifications(
         self,

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Federal Reserve releases</title>
+  <entry>
+    <title>Federal Reserve update</title>
+    <link rel="alternate" href="https://www.federalreserve.gov/newsevents/example.htm"/>
+    <updated>2026-04-03T16:45:00Z</updated>
+  </entry>
+</feed>

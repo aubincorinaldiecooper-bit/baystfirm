@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rdf:RDF
+  xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+  xmlns="http://purl.org/rss/1.0/"
+  xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <item rdf:about="https://www.bankofcanada.ca/press/example">
+    <title>Bank of Canada announcement</title>
+    <link>https://www.bankofcanada.ca/press/example</link>
+    <dc:date>2026-04-03T14:15:00Z</dc:date>
+  </item>
+</rdf:RDF>

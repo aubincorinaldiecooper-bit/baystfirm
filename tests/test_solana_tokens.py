@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import struct
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -109,6 +110,161 @@ def test_validate_mint_and_metadata_pda_use_solders_pubkeys() -> None:
     )
     with pytest.raises(ValueError, match="32-byte base58"):
         validate_mint("not-a-mint")
+
+
+def _market_card(liquidity: float, pool: str, first_seen_at: str) -> Any:
+    card = solana_module._pending_card(MINT, "Bonk", "BONK", first_seen_at)
+    market = {
+        "price_usd": 1.0,
+        "liquidity_usd": liquidity,
+        "volume_24h_usd": 0.0,
+        "price_change_24h_pct": 0.0,
+        "pool_created_at": None,
+        "pool_count": 1,
+        "total_liquidity_usd": liquidity,
+        "total_volume_24h_usd": 0.0,
+        "pools_checked_at": first_seen_at,
+        "main_pool": {"dex": "raydium", "address": pool, "labels": ["CPMM"]},
+        "geckoterminal_liquidity_usd": None,
+    }
+    facts = card.facts.model_copy(
+        update={
+            "market": solana_module.Fact(
+                status="ok",
+                value=market,
+                source="dexscreener",
+                fetched_at=first_seen_at,
+            )
+        }
+    )
+    return card.model_copy(update={"facts": facts})
+
+
+class _MarketRefreshChecker:
+    def __init__(self, pair: dict[str, Any]) -> None:
+        self.pair = pair
+
+    async def get_dex_pairs(self, mints: list[str]) -> dict[str, list[dict[str, Any]]]:
+        return {mint: [self.pair] for mint in mints}
+
+    async def liquidity_lock(self, main_pool: dict[str, Any] | None) -> Any:
+        del main_pool
+        return unavailable_fact("dexscreener", "No lock data")
+
+
+def _market_pair(
+    liquidity: float,
+    pool: str,
+    pool_created_at: datetime | None = None,
+) -> dict[str, Any]:
+    pair = {
+        "baseToken": {"address": MINT, "name": "Bonk", "symbol": "BONK"},
+        "pairAddress": pool,
+        "dexId": "raydium",
+        "labels": ["CPMM"],
+        "priceUsd": "1",
+        "liquidity": {"usd": str(liquidity)},
+        "volume": {"h24": "0"},
+    }
+    if pool_created_at is not None:
+        pair["pairCreatedAt"] = int(pool_created_at.timestamp() * 1000)
+    return pair
+
+
+@pytest.mark.asyncio
+async def test_token_launch_liquidity_event_fires_once() -> None:
+    first_seen_at = datetime.now(UTC).isoformat()
+    stored: list[Any] = []
+
+    async def sink(item: Any) -> None:
+        stored.append(item)
+
+    checker = _MarketRefreshChecker(
+        _market_pair(60_000, "pool-a", datetime.now(UTC) - timedelta(hours=2))
+    )
+    engine = SolanaTokenEngine(checker, news_sink=sink)  # type: ignore[arg-type]
+    engine.tokens[MINT] = solana_module._pending_card(MINT, "Bonk", "BONK", first_seen_at)
+
+    await engine.refresh_markets_once()
+    await engine.refresh_markets_once()
+
+    assert len(stored) == 1
+    assert stored[0].kind == "token_event"
+    assert stored[0].symbols == [MINT]
+    assert stored[0].details["total_liquidity_usd"] == 60_000
+    assert "BONK" in stored[0].title
+
+
+@pytest.mark.asyncio
+async def test_token_launch_does_not_emit_for_old_main_pool() -> None:
+    first_seen_at = datetime.now(UTC).isoformat()
+    stored: list[Any] = []
+
+    async def sink(item: Any) -> None:
+        stored.append(item)
+
+    checker = _MarketRefreshChecker(
+        _market_pair(1_000_000, "pool-old", datetime.now(UTC) - timedelta(days=30))
+    )
+    engine = SolanaTokenEngine(checker, news_sink=sink)  # type: ignore[arg-type]
+    engine.tokens[MINT] = solana_module._pending_card(MINT, "Bonk", "BONK", first_seen_at)
+
+    await engine.refresh_markets_once()
+
+    assert stored == []
+
+
+@pytest.mark.asyncio
+async def test_token_launch_requires_main_pool_creation_time() -> None:
+    first_seen_at = datetime.now(UTC).isoformat()
+    stored: list[Any] = []
+
+    async def sink(item: Any) -> None:
+        stored.append(item)
+
+    checker = _MarketRefreshChecker(_market_pair(60_000, "pool-missing-date"))
+    engine = SolanaTokenEngine(checker, news_sink=sink)  # type: ignore[arg-type]
+    engine.tokens[MINT] = solana_module._pending_card(MINT, "Bonk", "BONK", first_seen_at)
+
+    await engine.refresh_markets_once()
+
+    assert stored == []
+
+
+@pytest.mark.asyncio
+async def test_token_liquidity_drop_requires_same_pool_and_has_six_hour_cooldown() -> None:
+    first_seen_at = datetime.now(UTC).isoformat()
+    stored: list[Any] = []
+
+    async def sink(item: Any) -> None:
+        stored.append(item)
+
+    checker = _MarketRefreshChecker(_market_pair(10_000, "pool-a"))
+    engine = SolanaTokenEngine(checker, news_sink=sink)  # type: ignore[arg-type]
+    engine.tokens[MINT] = _market_card(20_000, "pool-a", first_seen_at)
+
+    await engine.refresh_markets_once()
+    checker.pair = _market_pair(5_000, "pool-a")
+    await engine.refresh_markets_once()
+
+    assert len(stored) == 1
+    assert stored[0].details["liquidity_before_usd"] == 20_000
+    assert stored[0].details["liquidity_after_usd"] == 10_000
+    assert stored[0].details["pool_address"] == "pool-a"
+
+    changed_pool: list[Any] = []
+
+    async def changed_pool_sink(item: Any) -> None:
+        changed_pool.append(item)
+
+    changed_checker = _MarketRefreshChecker(_market_pair(10_000, "pool-b"))
+    changed_engine = SolanaTokenEngine(
+        changed_checker,  # type: ignore[arg-type]
+        news_sink=changed_pool_sink,
+    )
+    changed_engine.tokens[MINT] = _market_card(20_000, "pool-a", first_seen_at)
+    await changed_engine.refresh_markets_once()
+    assert changed_pool == []
 
 
 @pytest.mark.asyncio

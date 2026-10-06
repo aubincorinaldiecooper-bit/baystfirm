@@ -1,11 +1,17 @@
 from baystfirm.adapters.base import MarketAdapter
-from baystfirm.adapters.bybit import BybitLinearAdapter
+from baystfirm.adapters.binanceus import BinanceUSAdapter
+from baystfirm.adapters.bybit import BybitLinearAdapter, BybitSpotAdapter
 from baystfirm.adapters.coinbase import CoinbaseAdapter
 from baystfirm.adapters.kraken import KrakenAdapter
+from baystfirm.adapters.okx import OkxSpotAdapter, OkxSwapAdapter
 
 __all__ = [
+    "BinanceUSAdapter",
     "BybitLinearAdapter",
+    "BybitSpotAdapter",
     "CoinbaseAdapter",
     "KrakenAdapter",
     "MarketAdapter",
+    "OkxSpotAdapter",
+    "OkxSwapAdapter",
 ]

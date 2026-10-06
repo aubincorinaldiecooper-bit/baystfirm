@@ -1,0 +1,24 @@
+{
+  "name": "Apple Inc.",
+  "filings": {
+    "recent": {
+      "form": ["8-K", "10-Q", "8-K/A", "S-1"],
+      "accessionNumber": [
+        "0000320193-26-000001",
+        "0000320193-26-000002",
+        "0000320193-26-000003",
+        "0000320193-26-000004"
+      ],
+      "filingDate": ["2026-04-03", "2026-03-30", "2026-03-25", "2026-03-20"],
+      "acceptanceDateTime": [
+        "2026-04-03T16:20:00.000Z",
+        "2026-03-30T16:20:00.000Z",
+        "",
+        "2026-03-20T16:20:00.000Z"
+      ],
+      "primaryDocument": ["aapl-8k.htm", "aapl-10q.htm", "aapl-8ka.htm", "aapl-s1.htm"],
+      "primaryDocDescription": ["Current report", "10-Q", "Amended current report", "S-1"],
+      "items": ["2.02, 7.01", "", "1.01", ""]
+    }
+  }
+}

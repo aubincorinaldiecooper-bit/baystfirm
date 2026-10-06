@@ -1,0 +1,18 @@
+[
+  {
+    "arg": {
+      "channel": "open-interest",
+      "instId": "BTC-USDT-SWAP"
+    },
+    "data": [
+      {
+        "instId": "BTC-USDT-SWAP",
+        "instType": "SWAP",
+        "oi": "2854317.50000000943",
+        "oiCcy": "28543.1750000000943",
+        "oiUsd": "2435429280.97000804609092",
+        "ts": "1791135341936"
+      }
+    ]
+  }
+]

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>SEC Press Releases</title>
+    <item>
+      <title><![CDATA[SEC <b>announces</b> new rules]]></title>
+      <link>https://www.sec.gov/news/press-release/example</link>
+      <pubDate>Fri, 03 Apr 2026 12:30:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>Entry without a link</title>
+      <pubDate>Fri, 03 Apr 2026 12:30:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>

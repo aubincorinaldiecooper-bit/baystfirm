@@ -4,7 +4,16 @@ import asyncio
 import logging
 from collections.abc import Callable
 
-from baystfirm.adapters import BybitLinearAdapter, CoinbaseAdapter, KrakenAdapter, MarketAdapter
+from baystfirm.adapters import (
+    BinanceUSAdapter,
+    BybitLinearAdapter,
+    BybitSpotAdapter,
+    CoinbaseAdapter,
+    KrakenAdapter,
+    MarketAdapter,
+    OkxSpotAdapter,
+    OkxSwapAdapter,
+)
 from baystfirm.config import Settings
 from baystfirm.models import MarketEvent
 from baystfirm.pipeline import IntelligencePipeline
@@ -13,20 +22,23 @@ logger = logging.getLogger(__name__)
 
 
 def build_adapters(settings: Settings) -> list[MarketAdapter]:
-    factories: dict[str, Callable[[tuple[str, ...]], MarketAdapter]] = {
-        "coinbase": CoinbaseAdapter,
-        "kraken": KrakenAdapter,
-        "bybit": BybitLinearAdapter,
+    factories: dict[str, tuple[Callable[[tuple[str, ...]], MarketAdapter], ...]] = {
+        "coinbase": (CoinbaseAdapter,),
+        "kraken": (KrakenAdapter,),
+        "bybit": (BybitSpotAdapter, BybitLinearAdapter),
+        "okx": (OkxSpotAdapter, OkxSwapAdapter),
+        "binanceus": (BinanceUSAdapter,),
     }
     adapters: list[MarketAdapter] = []
     for venue in settings.enabled_venues:
-        factory = factories.get(venue)
-        if factory is None:
+        venue_factories = factories.get(venue)
+        if venue_factories is None:
             logger.warning("ignoring unknown venue adapter: %s", venue)
             continue
-        adapter = factory(settings.symbols)
-        if adapter.symbols:
-            adapters.append(adapter)
+        for factory in venue_factories:
+            adapter = factory(settings.symbols)
+            if adapter.symbols:
+                adapters.append(adapter)
     return adapters
 
 
@@ -48,7 +60,7 @@ class IngestionSupervisor:
             self.tasks.append(
                 asyncio.create_task(
                     adapter.run(self._emit, self.stop_event),
-                    name=f"market-stream-{adapter.name}",
+                    name=f"market-stream-{adapter.name}-{type(adapter).__name__}",
                 )
             )
 

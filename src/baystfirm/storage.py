@@ -1,12 +1,31 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from datetime import datetime
+import json
+from collections.abc import AsyncIterator, Iterable
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+from uuid import uuid4
 
 import aiosqlite
 
-from baystfirm.models import Classification, MarketEvent
+from baystfirm.models import Candle, Classification, MarketEvent
+from baystfirm.news import NewsItem
+
+ClassificationRow = tuple[
+    str,
+    str,
+    int,
+    str,
+    str,
+    float,
+    int,
+    float | None,
+    str | None,
+    int,
+    str | None,
+]
+PRUNE_BATCH_SIZE = 20_000
 
 
 class EventStore:
@@ -39,6 +58,12 @@ class EventStore:
         )
         await self._connection.execute(
             """
+            CREATE INDEX IF NOT EXISTS idx_market_events_received
+            ON market_events(received_timestamp)
+            """
+        )
+        await self._connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS classifications (
                 classification_id TEXT PRIMARY KEY,
                 classifier TEXT NOT NULL,
@@ -50,6 +75,57 @@ class EventStore:
                 shadow INTEGER NOT NULL,
                 payload TEXT NOT NULL
             )
+            """
+        )
+        await self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_classifications_observed_at
+            ON classifications(observed_at)
+            """
+        )
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS evaluation_runs (
+                run_id TEXT PRIMARY KEY,
+                classifier TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS candles (
+                venue TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                interval TEXT NOT NULL,
+                open_time INTEGER NOT NULL,
+                open REAL NOT NULL,
+                high REAL NOT NULL,
+                low REAL NOT NULL,
+                close REAL NOT NULL,
+                volume REAL NOT NULL,
+                fetched_at TEXT NOT NULL,
+                PRIMARY KEY (venue, symbol, interval, open_time)
+            )
+            """
+        )
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS news_items (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                source TEXT NOT NULL,
+                published_at TEXT NOT NULL,
+                symbols TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        await self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_news_items_published_at
+            ON news_items(published_at)
             """
         )
         await self._connection.commit()
@@ -65,14 +141,38 @@ class EventStore:
             raise RuntimeError("event store is not open")
         return self._connection
 
+    async def _prune_timestamped_rows(
+        self, table: str, timestamp_column: str, older_than: datetime
+    ) -> int:
+        cutoff = older_than if older_than.tzinfo is not None else older_than.replace(tzinfo=UTC)
+        cutoff_text = cutoff.astimezone(UTC).isoformat()
+        total_deleted = 0
+        while True:
+            cursor = await self.connection.execute(
+                f"""
+                DELETE FROM {table}
+                WHERE rowid IN (
+                    SELECT rowid FROM {table} WHERE {timestamp_column} < ? LIMIT ?
+                )
+                """,
+                (cutoff_text, PRUNE_BATCH_SIZE),
+            )
+            batch_deleted = cursor.rowcount
+            await cursor.close()
+            await self.connection.commit()
+            total_deleted += batch_deleted
+            if batch_deleted < PRUNE_BATCH_SIZE:
+                break
+        cursor = await self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        await cursor.fetchone()
+        await cursor.close()
+        return total_deleted
+
     async def append_event(self, event: MarketEvent) -> None:
-        await self.connection.execute(
-            """
-            INSERT OR IGNORE INTO market_events (
-                event_id, venue, symbol, event_type, exchange_timestamp,
-                received_timestamp, payload
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
+        await self.append_events([event])
+
+    async def append_events(self, events: Iterable[MarketEvent]) -> None:
+        values = [
             (
                 str(event.event_id),
                 event.venue,
@@ -81,7 +181,19 @@ class EventStore:
                 event.exchange_timestamp.isoformat(),
                 event.received_timestamp.isoformat(),
                 event.model_dump_json(),
-            ),
+            )
+            for event in events
+        ]
+        if not values:
+            return
+        await self.connection.executemany(
+            """
+            INSERT OR IGNORE INTO market_events (
+                event_id, venue, symbol, event_type, exchange_timestamp,
+                received_timestamp, payload
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
         )
         await self.connection.commit()
 
@@ -144,6 +256,71 @@ class EventStore:
         await cursor.close()
         return int(row[0]) if row else 0
 
+    async def prune_events(self, older_than: datetime) -> int:
+        return await self._prune_timestamped_rows("market_events", "received_timestamp", older_than)
+
+    async def prune_classifications(self, older_than: datetime) -> int:
+        return await self._prune_timestamped_rows("classifications", "observed_at", older_than)
+
+    async def append_news(self, item: NewsItem) -> None:
+        await self.connection.execute(
+            """
+            INSERT OR IGNORE INTO news_items (
+                id, kind, source, published_at, symbols, payload
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item.id,
+                item.kind,
+                item.source,
+                item.published_at.isoformat(),
+                json.dumps(item.symbols),
+                item.model_dump_json(),
+            ),
+        )
+        await self.connection.commit()
+
+    async def iter_news(
+        self,
+        *,
+        symbol: str | None = None,
+        kinds: set[str] | None = None,
+        limit: int = 50,
+    ) -> list[NewsItem]:
+        if kinds is not None and not kinds:
+            return []
+        clauses: list[str] = []
+        parameters: list[str | int] = []
+        if symbol is not None:
+            clauses.append(
+                "EXISTS (SELECT 1 FROM json_each(news_items.symbols) "
+                "WHERE json_each.value = ? COLLATE BINARY)"
+            )
+            parameters.append(symbol)
+        if kinds is not None:
+            placeholders = ", ".join("?" for _ in kinds)
+            clauses.append(f"kind IN ({placeholders})")
+            parameters.extend(sorted(kinds))
+        query = "SELECT payload FROM news_items"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY published_at DESC, id DESC LIMIT ?"
+        parameters.append(limit)
+        cursor = await self.connection.execute(query, parameters)
+        items: list[NewsItem] = []
+        async for row in cursor:
+            items.append(NewsItem.model_validate_json(row[0]))
+        await cursor.close()
+        return items
+
+    async def prune_news(self, older_than: datetime) -> None:
+        cutoff = older_than if older_than.tzinfo is not None else older_than.replace(tzinfo=UTC)
+        await self.connection.execute(
+            "DELETE FROM news_items WHERE published_at < ?",
+            (cutoff.astimezone(UTC).isoformat(),),
+        )
+        await self.connection.commit()
+
     async def iter_classifications(
         self,
         *,
@@ -174,3 +351,133 @@ class EventStore:
         row = await cursor.fetchone()
         await cursor.close()
         return int(row[0]) if row else 0
+
+    async def classification_rows_since(self, since: datetime) -> list[ClassificationRow]:
+        cursor = await self.connection.execute(
+            """
+            SELECT
+                classifier,
+                symbol,
+                json_extract(payload, '$.horizon_seconds'),
+                observed_at,
+                label,
+                probability,
+                abstained,
+                json_extract(payload, '$.freshness_ms'),
+                json_extract(payload, '$.classifier_version'),
+                shadow,
+                json_extract(payload, '$.calibration_status')
+            FROM classifications
+            WHERE observed_at >= ?
+            ORDER BY observed_at
+            """,
+            (since.isoformat(),),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [
+            (
+                str(row[0]),
+                str(row[1]),
+                int(row[2]),
+                str(row[3]),
+                str(row[4]),
+                float(row[5]),
+                int(row[6]),
+                None if row[7] is None else float(row[7]),
+                None if row[8] is None else str(row[8]),
+                int(row[9]),
+                None if row[10] is None else str(row[10]),
+            )
+            for row in rows
+        ]
+
+    async def candles(
+        self, venue: str, symbol: str, interval: str, limit: int
+    ) -> tuple[list[Candle], datetime | None]:
+        cursor = await self.connection.execute(
+            """
+            SELECT open_time, open, high, low, close, volume, fetched_at
+            FROM candles
+            WHERE venue = ? AND symbol = ? AND interval = ?
+            ORDER BY open_time DESC
+            LIMIT ?
+            """,
+            (venue, symbol, interval, limit),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        candles = [
+            Candle(
+                open_time=int(row[0]),
+                open=float(row[1]),
+                high=float(row[2]),
+                low=float(row[3]),
+                close=float(row[4]),
+                volume=float(row[5]),
+            )
+            for row in rows
+        ]
+        fetched_at = max(datetime.fromisoformat(str(row[6])) for row in rows) if rows else None
+        return list(reversed(candles)), fetched_at
+
+    async def store_candles(
+        self,
+        venue: str,
+        symbol: str,
+        interval: str,
+        candles: Iterable[Candle],
+        fetched_at: datetime,
+    ) -> None:
+        values = [
+            (
+                venue,
+                symbol,
+                interval,
+                candle.open_time,
+                candle.open,
+                candle.high,
+                candle.low,
+                candle.close,
+                candle.volume,
+                fetched_at.isoformat(),
+            )
+            for candle in candles
+        ]
+        if not values:
+            return
+        await self.connection.executemany(
+            """
+            INSERT OR REPLACE INTO candles (
+                venue, symbol, interval, open_time, open, high, low, close, volume, fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+        await self.connection.commit()
+
+    async def append_evaluation_run(self, classifier: str, payload: dict[str, Any]) -> str:
+        run_id = str(uuid4())
+        created_at = datetime.now(UTC).isoformat()
+        record = {"run_id": run_id, "classifier": classifier, "created_at": created_at, **payload}
+        await self.connection.execute(
+            "INSERT INTO evaluation_runs (run_id, classifier, created_at, payload) "
+            "VALUES (?, ?, ?, ?)",
+            (run_id, classifier, created_at, json.dumps(record)),
+        )
+        await self.connection.commit()
+        return run_id
+
+    async def latest_evaluation_runs(self) -> list[dict[str, Any]]:
+        cursor = await self.connection.execute(
+            """
+            SELECT payload FROM evaluation_runs AS run
+            WHERE created_at = (
+                SELECT MAX(created_at) FROM evaluation_runs WHERE classifier = run.classifier
+            )
+            ORDER BY classifier
+            """
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [json.loads(row[0]) for row in rows]

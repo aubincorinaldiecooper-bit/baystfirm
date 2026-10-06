@@ -1,0 +1,16 @@
+[
+  {
+    "arg": {
+      "channel": "mark-price",
+      "instId": "BTC-USDT-SWAP"
+    },
+    "data": [
+      {
+        "instId": "BTC-USDT-SWAP",
+        "instType": "SWAP",
+        "markPx": "85324.4",
+        "ts": "1791135348978"
+      }
+    ]
+  }
+]

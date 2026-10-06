@@ -13,7 +13,9 @@ liquidations, on-chain observations, DeFi state, reserve attestations, and token
 
 ```text
 Coinbase spot ─┐
-Kraken spot ───┼─ venue adapters ─ normalized MarketEvent ─ SQLite/WAL
+Kraken spot ───┤
+OKX spot ──────┼─ venue adapters ─ normalized MarketEvent ─ SQLite/WAL
+Bybit spot ────┤                              │
 Bybit perps ───┘                              │
                                              ├─ realtime WebSocket
                                              └─ bounded classifiers
@@ -34,7 +36,8 @@ and classifier contracts should remain unchanged.
 
 The initial classifiers are deliberately bounded:
 
-- `stablecoin_peg`: requires fresh observations from at least two venues and classifies pegged,
+- `stablecoin_peg`: converts each fresh observation to USD (stablecoin-quoted pairs use the
+  current USD price of the quote stablecoin), requires at least two venues, and classifies pegged,
   watch, or depegged states;
 - `short_horizon_momentum`: classifies a thirty-second trade window as upward, downward, or
   range-bound.
@@ -44,7 +47,12 @@ Both are versioned rule baselines, not trained models. They remain marked `uncal
 
 ## Evaluation plane
 
-Evaluation accepts explicit prediction records with expected labels. It reports:
+Binance is not included because its public stream rejects connections from the development
+region (HTTP 451).
+
+`evaluate-replay` labels each prediction with the non-abstained state the same classifier observed
+one horizon later (within a five-second tolerance). This measures whether a stated state persists
+over its horizon; it is not a forecast of returns. Evaluation reports:
 
 - sample count and non-abstained coverage;
 - accuracy and false-alert rate;

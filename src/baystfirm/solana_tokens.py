@@ -353,6 +353,10 @@ def _pair_volume_24h(pair: Mapping[str, Any]) -> float:
     return _optional_float(value) or 0.0
 
 
+def _pair_price(pair: Mapping[str, Any]) -> float | None:
+    return _optional_float(pair.get("priceUsd"))
+
+
 def parse_dex_pairs(body: Any, mint: str) -> list[dict[str, Any]]:
     if not isinstance(body, list):
         return []
@@ -440,7 +444,32 @@ def parse_geckoterminal_holders(body: Any) -> dict[str, Any] | None:
 def select_main_pool(pairs: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not pairs:
         return None
-    return max(pairs, key=_pair_liquidity)
+
+    priced_pairs: list[tuple[dict[str, Any], float, float]] = []
+    for pair in pairs:
+        price = _pair_price(pair)
+        if price is not None and price > 0:
+            priced_pairs.append((pair, price, max(0.0, _pair_volume_24h(pair))))
+    if not priced_pairs:
+        return max(pairs, key=_pair_liquidity)
+
+    total_volume = sum(volume for _, _, volume in priced_pairs)
+    if total_volume > 0:
+        cumulative_volume = 0.0
+        reference_price: float | None = None
+        for _, price, volume in sorted(priced_pairs, key=lambda item: item[1]):
+            cumulative_volume += volume
+            if cumulative_volume >= total_volume / 2:
+                reference_price = price
+                break
+        if reference_price is None:
+            return max(pairs, key=_pair_liquidity)
+    else:
+        prices = sorted(price for _, price, _ in priced_pairs)
+        reference_price = prices[(len(prices) - 1) // 2]
+
+    eligible = [pair for pair, price, _ in priced_pairs if abs(price / reference_price - 1) <= 0.10]
+    return max(eligible or pairs, key=_pair_liquidity)
 
 
 def classify_pool_type(dex_id: str, labels: Any) -> PoolType:

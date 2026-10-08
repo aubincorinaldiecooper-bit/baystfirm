@@ -233,8 +233,8 @@ def _extract(
     limit: int | None,
     limit_per_split: int | None,
 ) -> None:
-    import torch
     import numpy as np
+    import torch
 
     from .backbone import BackboneConfig, MiniCPMVisionBackbone
 
@@ -442,9 +442,9 @@ def _train(features_path: Path, output_path: Path) -> None:
 def _predict(dataset_dir: Path, model_dir: str, head_path: Path, out_dir: Path) -> None:
     import torch
 
-    from .backbone import BackboneConfig, MiniCPMVBackbone
-    from .chart_head import ChartStateHead
+    from .backbone import BackboneConfig, MiniCPMVisionBackbone
     from .chart import chart_evidence, load_ticks
+    from .chart_head import ChartStateHead
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(head_path, map_location="cpu", weights_only=False)

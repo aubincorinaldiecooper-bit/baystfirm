@@ -21,7 +21,6 @@ HF_CACHE_VOLUME_NAME = os.environ.get("MINICPM_V46_CACHE_VOLUME") or "minicpm-v4
 visual_data = modal.Volume.from_name(VISUAL_VOLUME_NAME, create_if_missing=False)
 hf_cache = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=False)
 
-# Keep the pinned visual runtime packages/install aligned with modal/gnsis_visual.py.
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("libgl1", "libglib2.0-0")
@@ -32,14 +31,7 @@ image = (
         "accelerate==1.14.0",
         "huggingface_hub==1.33.0",
         "numpy==2.5.2",
-        "rapidocr==3.9.2",
-        "onnxruntime==1.30.0",
-        "opencv-python==5.0.0.93",
-        "fastapi>=0.110",
-        "uvicorn[standard]>=0.29",
-        "websockets>=12",
         "pillow>=10",
-        "PyJWT[crypto]>=2.8",
     )
     .add_local_dir(SOURCE_DIR, remote_path="/workspace/src", copy=True)\n    .env({"PYTHONPATH": "/workspace/src"})
 )

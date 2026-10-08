@@ -39,9 +39,7 @@ image = (
 app = modal.App(APP_NAME, image=image, include_source=True)
 
 
-def _smoke_dataset(
-    source: Path, destination: Path, maximum_per_split: int = 64
-) -> Path:
+def _smoke_dataset(source: Path, destination: Path, maximum_per_split: int = 64) -> Path:
     destination.mkdir(parents=True, exist_ok=True)
     counts: dict[str, int] = {}
     samples: list[dict[str, object]] = []
@@ -84,9 +82,7 @@ def _run(*arguments: str) -> None:
     timeout=3600,
     max_containers=1,
 )
-def train_chart(
-    name: str, dataset_volume_path: str, smoke: bool = False
-) -> dict[str, str]:
+def train_chart(name: str, dataset_volume_path: str, smoke: bool = False) -> dict[str, str]:
     """Extract, train, predict, and persist artifacts on the visual-data volume."""
     os.environ["HF_HOME"] = "/hf-cache"
     os.environ["HF_HUB_CACHE"] = "/hf-cache/hub"
@@ -98,13 +94,9 @@ def train_chart(
         cache_dir="/hf-cache/hub",
         local_files_only=True,
     )
-    work_dir = (
-        Path("/tmp/baystfirm-chart-smoke") if smoke else Path("/visual/chart-runs") / name
-    )
+    work_dir = Path("/tmp/baystfirm-chart-smoke") if smoke else Path("/visual/chart-runs") / name
     dataset_dir = (
-        _smoke_dataset(source, Path("/tmp/baystfirm-chart-smoke/dataset"))
-        if smoke
-        else source
+        _smoke_dataset(source, Path("/tmp/baystfirm-chart-smoke/dataset")) if smoke else source
     )
     head_dir = work_dir / "heads" if smoke else Path("/visual/heads")
     run_dir = work_dir / "outputs" if smoke else Path("/visual/chart-runs") / name
@@ -140,9 +132,7 @@ def train_chart(
     sidecar_path = head_path.with_suffix(".json")
     return {
         "records": (run_dir / "records.jsonl").read_text(encoding="utf-8"),
-        "baseline_records": (run_dir / "baseline_records.jsonl").read_text(
-            encoding="utf-8"
-        ),
+        "baseline_records": (run_dir / "baseline_records.jsonl").read_text(encoding="utf-8"),
         "sidecar": sidecar_path.read_text(encoding="utf-8"),
     }
 
@@ -165,9 +155,7 @@ def main(
         existing = []
     if not existing:
         with visual_data.batch_upload(force=True) as upload:
-            upload.put_directory(
-                str(local_dataset), remote_path=f"/{dataset_volume_path}"
-            )
+            upload.put_directory(str(local_dataset), remote_path=f"/{dataset_volume_path}")
     result = train_chart.remote(name, dataset_volume_path, smoke)
     local_output = Path("/home/ubuntu/data/baystfirm/chart/run")
     local_output.mkdir(parents=True, exist_ok=True)

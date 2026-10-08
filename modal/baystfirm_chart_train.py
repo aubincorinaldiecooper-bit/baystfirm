@@ -33,7 +33,8 @@ image = (
         "numpy==2.5.2",
         "pillow>=10",
     )
-    .add_local_dir(SOURCE_DIR, remote_path="/workspace/src", copy=True)\n    .env({"PYTHONPATH": "/workspace/src"})
+    .add_local_dir(SOURCE_DIR, remote_path="/workspace/src", copy=True)
+    .env({"PYTHONPATH": "/workspace/src"})
 )
 app = modal.App(APP_NAME, image=image, include_source=True)
 

@@ -170,7 +170,7 @@ def load_ticks(path: str | Path) -> list[Tick]:
             Tick(int(row["timestamp_ms"]), float(row["price"]), float(row["size"]))
             for row in reader
         ]
-    if any(left.ts_ms > right.ts_ms for left, right in zip(ticks, ticks[1:])):
+    if any(left.ts_ms > right.ts_ms for left, right in zip(ticks, ticks[1:], strict=False)):
         raise ValueError(f"{path} ticks are not sorted by timestamp_ms")
     return ticks
 

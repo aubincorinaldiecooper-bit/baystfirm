@@ -7,6 +7,8 @@ from torch import nn
 from torch.nn import functional as F
 
 from .chart import CHART_LABELS
+
+
 class Pointer(nn.Module):
     """Small query/key pointer used only by Baystfirm's chart-state head."""
 
@@ -26,7 +28,6 @@ class Pointer(nn.Module):
         if mask is not None:
             scores = scores.masked_fill(~mask, float("-inf"))
         return scores
-
 
 
 class ChartStateHead(nn.Module):

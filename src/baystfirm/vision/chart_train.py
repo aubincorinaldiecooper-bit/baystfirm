@@ -28,30 +28,22 @@ SEED = 0
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(
-        description="Build and train the shadow chart-state head."
-    )
+    parser = argparse.ArgumentParser(description="Build and train the shadow chart-state head.")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    build = commands.add_parser(
-        "build", help="Render labeled chart samples from trade ticks."
-    )
+    build = commands.add_parser("build", help="Render labeled chart samples from trade ticks.")
     build.add_argument("--ticks-dir", type=Path, required=True)
     build.add_argument("--days", type=Path, required=True)
     build.add_argument("--out", type=Path, required=True)
 
-    extract = commands.add_parser(
-        "extract", help="Extract frozen visual backbone embeddings."
-    )
+    extract = commands.add_parser("extract", help="Extract frozen visual backbone embeddings.")
     extract.add_argument("--dataset", type=Path, required=True)
     extract.add_argument("--model-dir", required=True)
     extract.add_argument("--out", type=Path, required=True)
     extract.add_argument("--limit", type=int)
     extract.add_argument("--limit-per-split", type=int)
 
-    train = commands.add_parser(
-        "train", help="Train and calibrate the chart-state pointer head."
-    )
+    train = commands.add_parser("train", help="Train and calibrate the chart-state pointer head.")
     train.add_argument("--features", type=Path, required=True)
     train.add_argument("--out", type=Path, required=True)
 
@@ -67,9 +59,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "build":
         _build(args.ticks_dir, args.days, args.out)
     elif args.command == "extract":
-        _extract(
-            args.dataset, args.model_dir, args.out, args.limit, args.limit_per_split
-        )
+        _extract(args.dataset, args.model_dir, args.out, args.limit, args.limit_per_split)
     elif args.command == "train":
         _train(args.features, args.out)
     elif args.command == "predict":
@@ -122,13 +112,9 @@ def _build(ticks_dir: Path, days_path: Path, out_dir: Path) -> None:
                 ticks_output / f"{native}-{date}.csv",
             )
     selected_groups: dict[tuple[str, str], list[ChartSample]] = {}
-    selected_counts = {
-        split: dict.fromkeys(CHART_LABELS, 0) for split in ("train", "val", "test")
-    }
+    selected_counts = {split: dict.fromkeys(CHART_LABELS, 0) for split in ("train", "val", "test")}
     for (split, symbol), candidates in sorted(candidate_groups.items()):
-        selected = (
-            _evenly_sample(candidates, 4000) if split in ("val", "test") else candidates
-        )
+        selected = _evenly_sample(candidates, 4000) if split in ("val", "test") else candidates
         selected_groups[(split, symbol)] = selected
         for sample in selected:
             selected_counts[split][sample.label] += 1
@@ -138,23 +124,15 @@ def _build(ticks_dir: Path, days_path: Path, out_dir: Path) -> None:
         for (split, symbol), selected in sorted(selected_groups.items()):
             by_date: dict[str, list[ChartSample]] = defaultdict(list)
             for sample in selected:
-                date = (
-                    datetime.fromtimestamp(sample.anchor_ms / 1000, tz=UTC)
-                    .date()
-                    .isoformat()
-                )
+                date = datetime.fromtimestamp(sample.anchor_ms / 1000, tz=UTC).date().isoformat()
                 if date not in days_by_date:
-                    raise ValueError(
-                        f"sample anchor date {date} is absent from days.json"
-                    )
+                    raise ValueError(f"sample anchor date {date} is absent from days.json")
                 by_date[date].append(sample)
             native = symbol.replace("-", "")
             for date, day_samples in sorted(by_date.items()):
                 ticks = _load_ticks(ticks_dir / f"{native}-{date}.csv")
                 for sample in day_samples:
-                    relative_image = (
-                        Path("images") / split / f"{symbol}-{sample.anchor_ms}.png"
-                    )
+                    relative_image = Path("images") / split / f"{symbol}-{sample.anchor_ms}.png"
                     image_path = out_dir / relative_image
                     image_path.parent.mkdir(parents=True, exist_ok=True)
                     render_chart(ticks, sample.anchor_ms).save(image_path, format="PNG")
@@ -193,9 +171,7 @@ def _build(ticks_dir: Path, days_path: Path, out_dir: Path) -> None:
 def _balance_train_samples(samples: list[ChartSample]) -> list[ChartSample]:
     movement = [sample for sample in samples if sample.label != NORMAL_LABEL]
     range_bound = [sample for sample in samples if sample.label == NORMAL_LABEL]
-    selected_range = _evenly_sample(
-        range_bound, min(len(range_bound), 2 * len(movement))
-    )
+    selected_range = _evenly_sample(range_bound, min(len(range_bound), 2 * len(movement)))
     selected_anchors = {sample.anchor_ms for sample in selected_range}
     return [
         sample
@@ -220,9 +196,7 @@ def _load_ticks(path: Path) -> list[Tick]:
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
     ]
 
 
@@ -239,9 +213,7 @@ def _extract(
     from .backbone import BackboneConfig, MiniCPMVisionBackbone
 
     records = _read_jsonl(dataset_dir / "samples.jsonl")
-    dataset_metadata = json.loads(
-        (dataset_dir / "dataset.json").read_text(encoding="utf-8")
-    )
+    dataset_metadata = json.loads((dataset_dir / "dataset.json").read_text(encoding="utf-8"))
     if limit_per_split is not None:
         selected: list[dict[str, Any]] = []
         counts: dict[str, int] = defaultdict(int)
@@ -276,9 +248,7 @@ def _extract(
                 shape=(len(records), *embedding_shape),
             )
         if tuple(embedding.shape) != embedding_shape:
-            raise ValueError(
-                "visual embedding shapes differ; expected fixed-size chart inputs"
-            )
+            raise ValueError("visual embedding shapes differ; expected fixed-size chart inputs")
         embedding_store[index] = embedding
     if embedding_store is None:
         raise RuntimeError("feature extraction produced no visual embeddings")
@@ -308,9 +278,7 @@ def _train(features_path: Path, output_path: Path) -> None:
     from .chart_head import ChartStateHead
 
     torch.manual_seed(SEED)
-    payload = torch.load(
-        features_path, map_location="cpu", weights_only=False, mmap=True
-    )
+    payload = torch.load(features_path, map_location="cpu", weights_only=False, mmap=True)
     embeddings = payload["embeds"]
     labels = payload["labels"].long()
     splits = payload["splits"]
@@ -332,9 +300,7 @@ def _train(features_path: Path, output_path: Path) -> None:
 
     for epoch in range(30):
         model.train()
-        order = torch.tensor(train_indices)[
-            torch.randperm(len(train_indices), generator=generator)
-        ]
+        order = torch.tensor(train_indices)[torch.randperm(len(train_indices), generator=generator)]
         for batch_start in range(0, len(order), 256):
             indices = order[batch_start : batch_start + 256]
             batch_x = embeddings[indices].to(device=device, dtype=torch.float32)
@@ -348,16 +314,13 @@ def _train(features_path: Path, output_path: Path) -> None:
         model.eval()
         val_y = labels[val_indices].to(device)
         with torch.no_grad():
-            val_logits = _logits_for_indices(
-                model, embeddings, val_indices, device, torch
-            )
+            val_logits = _logits_for_indices(model, embeddings, val_indices, device, torch)
             val_loss = float(F.cross_entropy(val_logits + logit_adjust, val_y).item())
         if val_loss < best_loss:
             best_loss = val_loss
             best_epoch = epoch + 1
             best_state = {
-                key: value.detach().cpu().clone()
-                for key, value in model.state_dict().items()
+                key: value.detach().cpu().clone() for key, value in model.state_dict().items()
             }
             stale_epochs = 0
         else:
@@ -372,39 +335,29 @@ def _train(features_path: Path, output_path: Path) -> None:
     model.eval()
     val_y = labels[val_indices].to(device)
     with torch.no_grad():
-        raw_val_logits = _logits_for_indices(
-            model, embeddings, val_indices, device, torch
-        )
+        raw_val_logits = _logits_for_indices(model, embeddings, val_indices, device, torch)
     _fit_adjusted_temperature(model, raw_val_logits, val_y, logit_adjust)
     with torch.no_grad():
-        calibrated_logits = _logits_for_indices(
-            model, embeddings, val_indices, device, torch
-        )
+        calibrated_logits = _logits_for_indices(model, embeddings, val_indices, device, torch)
         val_probabilities = torch.softmax(calibrated_logits, dim=-1)
         val_confidence, val_predictions = val_probabilities.max(dim=-1)
         label_recall: dict[str, float] = {}
         for label_index in sorted({int(index) for index in val_y.tolist()}):
             expected = val_y == label_index
-            true_positives = (
-                expected & (val_predictions == label_index) & (val_confidence >= 0.5)
-            )
+            true_positives = expected & (val_predictions == label_index) & (val_confidence >= 0.5)
             label_recall[CHART_LABELS[label_index]] = float(
                 true_positives.sum().item() / expected.sum().item()
             )
         val_metrics = {
             "nll": float(F.cross_entropy(calibrated_logits, val_y).item()),
-            "accuracy": float(
-                (calibrated_logits.argmax(-1) == val_y).float().mean().item()
-            ),
+            "accuracy": float((calibrated_logits.argmax(-1) == val_y).float().mean().item()),
             "samples": len(val_indices),
             "label_recall": label_recall,
             "macro_recall": sum(label_recall.values()) / len(label_recall),
         }
 
     checkpoint = {
-        "state_dict": {
-            key: value.detach().cpu() for key, value in model.state_dict().items()
-        },
+        "state_dict": {key: value.detach().cpu() for key, value in model.state_dict().items()},
         "hidden_size": int(embeddings.shape[-1]),
         "proj": 256,
         "label_order": list(CHART_LABELS),
@@ -459,9 +412,7 @@ def _predict(dataset_dir: Path, model_dir: str, head_path: Path, out_dir: Path) 
     )
 
     samples = [
-        item
-        for item in _read_jsonl(dataset_dir / "samples.jsonl")
-        if item["split"] == "test"
+        item for item in _read_jsonl(dataset_dir / "samples.jsonl") if item["split"] == "test"
     ]
     tick_cache: dict[tuple[str, str], list[Tick]] = {}
     records: list[dict[str, Any]] = []
@@ -481,9 +432,7 @@ def _predict(dataset_dir: Path, model_dir: str, head_path: Path, out_dir: Path) 
         _sync_device(device)
         started = time.perf_counter()
         image = render_chart(ticks, anchor_ms)
-        visual = backbone.encode_visual(image).embeds.to(
-            device=device, dtype=torch.float32
-        )
+        visual = backbone.encode_visual(image).embeds.to(device=device, dtype=torch.float32)
         visual = visual.unsqueeze(0)
         mask = torch.ones(visual.shape[:2], dtype=torch.bool, device=device)
         with torch.no_grad():

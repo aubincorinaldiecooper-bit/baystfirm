@@ -99,9 +99,7 @@ def render_chart(ticks: Sequence[Tick], anchor_ms: int) -> Image.Image:
             IMAGE_SIZE - 1,
             max(
                 0,
-                (tick.ts_ms - start_ms)
-                * (IMAGE_SIZE - 1)
-                // (WINDOW_SECONDS * _MILLISECONDS),
+                (tick.ts_ms - start_ms) * (IMAGE_SIZE - 1) // (WINDOW_SECONDS * _MILLISECONDS),
             ),
         )
         prices_by_column[column] = tick.price
@@ -139,17 +137,12 @@ def _price_y(bps: float) -> int:
     return round((Y_RANGE_BPS - clipped) * (_PRICE_HEIGHT - 1) / (2 * Y_RANGE_BPS))
 
 
-def chart_evidence(
-    ticks: Sequence[Tick], anchor_ms: int
-) -> dict[str, int | float | None]:
-    recent = ticks_between(
-        ticks, anchor_ms - HORIZON_SECONDS * _MILLISECONDS, anchor_ms
-    )
+def chart_evidence(ticks: Sequence[Tick], anchor_ms: int) -> dict[str, int | float | None]:
+    recent = ticks_between(ticks, anchor_ms - HORIZON_SECONDS * _MILLISECONDS, anchor_ms)
     persistence = momentum_label(ticks, anchor_ms)
     window = ticks_between(ticks, anchor_ms - WINDOW_SECONDS * _MILLISECONDS, anchor_ms)
     range_bps = (
-        (max(tick.price for tick in window) / min(tick.price for tick in window) - 1)
-        * 10_000
+        (max(tick.price for tick in window) / min(tick.price for tick in window) - 1) * 10_000
         if window and min(tick.price for tick in window) > 0
         else None
     )

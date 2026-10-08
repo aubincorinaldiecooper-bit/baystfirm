@@ -54,9 +54,7 @@ def test_momentum_label_uses_exact_thresholds() -> None:
 def test_momentum_label_abstains_for_insufficient_or_invalid_windows() -> None:
     assert momentum_label(_window_ticks(count=MIN_TRADES - 1), 30_000) is None
     assert momentum_label(_window_ticks(duration_ms=9_000), 30_000) is None
-    assert (
-        momentum_label(_window_ticks(first_price=0.0, last_price=0.0), 30_000) is None
-    )
+    assert momentum_label(_window_ticks(first_price=0.0, last_price=0.0), 30_000) is None
 
 
 def test_future_ticks_do_not_change_rendered_chart() -> None:
@@ -72,26 +70,18 @@ def test_future_ticks_do_not_change_rendered_chart() -> None:
 
 def test_build_samples_stride_skip_and_deterministic_subsample() -> None:
     ticks = [Tick(ts_ms, 100.0, 1.0) for ts_ms in range(0, 700_000, 1000)]
-    samples = build_samples(
-        ticks, "BTC-USDT", "train", stride_seconds=60, max_samples=3
-    )
+    samples = build_samples(ticks, "BTC-USDT", "train", stride_seconds=60, max_samples=3)
     assert [sample.anchor_ms for sample in samples] == [300_000, 480_000, 660_000]
-    assert samples == build_samples(
-        ticks, "BTC-USDT", "train", stride_seconds=60, max_samples=3
-    )
+    assert samples == build_samples(ticks, "BTC-USDT", "train", stride_seconds=60, max_samples=3)
     sparse = [tick for tick in ticks if not 360_000 <= tick.ts_ms < 400_000]
-    skipped = build_samples(
-        sparse, "BTC-USDT", "train", stride_seconds=60, max_samples=100
-    )
+    skipped = build_samples(sparse, "BTC-USDT", "train", stride_seconds=60, max_samples=100)
     assert 360_000 not in {sample.anchor_ms for sample in skipped}
     assert all(sample.label == "range_bound" for sample in samples)
 
 
 def test_build_samples_can_keep_more_than_the_old_default_cap() -> None:
     ticks = [Tick(ts_ms, 100.0, 1.0) for ts_ms in range(0, 1_400_000, 1000)]
-    samples = build_samples(
-        ticks, "BTC-USDT", "train", stride_seconds=1, max_samples=None
-    )
+    samples = build_samples(ticks, "BTC-USDT", "train", stride_seconds=1, max_samples=None)
     assert len(samples) > 1000
 
 
@@ -178,9 +168,7 @@ def test_render_chart_is_deterministic_448_rgb_and_clips_price_bps() -> None:
     assert image.size == (448, 448)
     assert image.mode == "RGB"
     assert first.getvalue() == second.getvalue()
-    assert any(
-        image.getpixel((x, y)) == (0, 0, 0) for x in range(448) for y in range(3)
-    )
+    assert any(image.getpixel((x, y)) == (0, 0, 0) for x in range(448) for y in range(3))
 
 
 def test_outcome_and_persistence_use_distinct_30_second_windows() -> None:
@@ -222,9 +210,7 @@ def test_chart_head_forward_mask_temperature_and_abstention() -> None:
     assert torch.allclose(head(embeds, mask), output + bias)
     head.logit_bias.zero_()
 
-    logits = torch.tensor(
-        [[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0], [10.0, 0.0, 0.0]]
-    )
+    logits = torch.tensor([[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0], [10.0, 0.0, 0.0]])
     targets = torch.tensor([0, 1, 2, 1])
     before = F.cross_entropy(logits, targets).item()
     head.fit_temperature(logits, targets)

@@ -67,9 +67,14 @@ both. Repeat `--date` for each UTC archive day; at least one output is required:
 ```
 
 The importer verifies Binance's published SHA-256 checksum before reading each cached or downloaded
-archive. Chart-state predictions use `gnsis_chart_momentum` and are graded against realized
+archive. Chart-state predictions use `baystfirm_chart_momentum` and are graded against realized
 `short_horizon_momentum` outcomes; all learned outputs remain shadow and uncalibrated until
 validated.
+
+Baystfirm owns all market semantics, chart labels, training and calibration. When it needs
+autonomous browser vision, it consumes Panoptic as an external visual/browser capability through
+its public API/SDK. Baystfirm does not import GNSIS runtime internals or place market-specific
+logic inside the GNSIS codebase.
 
 ## Indicators and strategy backtests
 

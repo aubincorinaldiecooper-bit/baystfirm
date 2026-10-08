@@ -45,6 +45,18 @@ The initial classifiers are deliberately bounded:
 Both are versioned rule baselines, not trained models. They remain marked `uncalibrated` and
 `shadow` until replay and live shadow evaluation pass the promotion gate.
 
+## Visual/browser boundary
+
+Baystfirm owns market semantics, labels, calibration, evaluation and any specialized market
+heads. Panoptic/GNSIS is an external visual/browser capability only: Baystfirm may use its public
+API/SDK to watch rendered charts, inspect visual history, read pixels and navigate the web, but
+Baystfirm must not import GNSIS runtime internals and GNSIS must not contain Baystfirm market
+logic.
+
+The offline chart-state experiment lives under `baystfirm.vision` for this reason. It can use a
+frozen vision backbone to train Baystfirm-owned market heads without making those market semantics
+part of Panoptic.
+
 ## Evaluation plane
 
 Binance is not included because its public stream rejects connections from the development

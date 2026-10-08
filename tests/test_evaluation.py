@@ -102,7 +102,7 @@ def test_labels_come_from_state_one_horizon_later() -> None:
 
 def test_chart_classifier_uses_rules_classifier_as_realized_outcome() -> None:
     chart = Classification(
-        classifier="gnsis_chart_momentum",
+        classifier="baystfirm_chart_momentum",
         classifier_version="shadow-v1",
         symbol="BTC-USDT",
         label="upward_momentum",
@@ -126,7 +126,7 @@ def test_chart_classifier_uses_rules_classifier_as_realized_outcome() -> None:
         freshness_ms=0,
     )
     later_chart_prediction = Classification(
-        classifier="gnsis_chart_momentum",
+        classifier="baystfirm_chart_momentum",
         classifier_version="shadow-v1",
         symbol="BTC-USDT",
         label="downward_momentum",
@@ -141,7 +141,7 @@ def test_chart_classifier_uses_rules_classifier_as_realized_outcome() -> None:
     assert record.predicted_label == "upward_momentum"
     assert record.expected_label == "range_bound"
     assert record.normal_label == "range_bound"
-    assert record.classifier == "gnsis_chart_momentum"
+    assert record.classifier == "baystfirm_chart_momentum"
 
 
 def test_multi_horizon_predictions_only_match_same_horizon_outcomes() -> None:

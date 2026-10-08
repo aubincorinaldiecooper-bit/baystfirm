@@ -13,10 +13,10 @@ from baystfirm.models import Classification
 NORMAL_LABELS = {
     "stablecoin_peg": "pegged",
     "short_horizon_momentum": "range_bound",
-    "gnsis_chart_momentum": "range_bound",
+    "baystfirm_chart_momentum": "range_bound",
     "momentum_regime": "range_bound",
 }
-OUTCOME_CLASSIFIER = {"gnsis_chart_momentum": "short_horizon_momentum"}
+OUTCOME_CLASSIFIER = {"baystfirm_chart_momentum": "short_horizon_momentum"}
 MULTI_HORIZON = frozenset({"momentum_regime"})
 
 

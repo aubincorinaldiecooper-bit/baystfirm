@@ -59,9 +59,7 @@ class ChartStateHead(nn.Module):
         scores = scores.masked_fill(~mask.bool(), float("-inf"))
         weights = torch.softmax(scores, dim=-1)
         pooled = torch.einsum("bn,bnd->bd", weights, normalized)
-        labels = self.label_embeddings.unsqueeze(0).expand(
-            visual_embeds.shape[0], -1, -1
-        )
+        labels = self.label_embeddings.unsqueeze(0).expand(visual_embeds.shape[0], -1, -1)
         return (self.pointer(pooled, labels) + self.logit_bias) / self.temperature
 
     def fit_temperature(self, logits: torch.Tensor, targets: torch.Tensor) -> float:
@@ -88,15 +86,11 @@ class ChartStateHead(nn.Module):
         return float(self.temperature.item())
 
     @staticmethod
-    def decide(
-        probs: torch.Tensor, min_confidence: float = 0.5
-    ) -> tuple[str, float, bool]:
+    def decide(probs: torch.Tensor, min_confidence: float = 0.5) -> tuple[str, float, bool]:
         values = probs.detach().reshape(-1)
         probability, index = values.max(dim=0)
         confidence = float(probability.item())
         label_index = int(index.item())
         if label_index >= len(CHART_LABELS):
-            raise ValueError(
-                f"probability vector has unsupported label index {label_index}"
-            )
+            raise ValueError(f"probability vector has unsupported label index {label_index}")
         return CHART_LABELS[label_index], confidence, confidence < min_confidence

@@ -77,9 +77,7 @@ class MiniCPMVisionBackbone:
         side = 4 if self.divisor == 16 else 2
         grid = (int(sizes[0, 0]) // side, int(sizes[0, 1]) // side)
         if grid[0] * grid[1] != embeds.shape[0]:
-            raise RuntimeError(
-                f"visual token grid {grid} does not match {embeds.shape[0]} tokens"
-            )
+            raise RuntimeError(f"visual token grid {grid} does not match {embeds.shape[0]} tokens")
         return VisualTokens(
             embeds=embeds,
             grid=grid,
